@@ -1,0 +1,11 @@
+[package]
+name = "bsp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mcan = "0.5.0"
+atsamd-hal = {git="https://github.com/atsamd-rs/atsamd", branch="master", features=["same51j-rt", "can"] }
+
+[package.metadata]
+chip = "ATSAME51J20A"
