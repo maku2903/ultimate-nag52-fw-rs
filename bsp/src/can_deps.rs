@@ -1,7 +1,7 @@
 use atsamd_hal::{can::Dependencies, pac};
 use mcan::{message::{rx, tx}, rx_fifo::{Fifo0, RxFifo}};
 
-use crate::Can0Rx;
+use crate::{CanRx, CanTx};
 use mcan::generic_array::typenum::{U0, U1, U32, U64};
 use atsamd_hal::clock::v2::types::Can0;
 pub struct Capacities;
@@ -31,5 +31,5 @@ pub type Can0TxEventFifo = mcan::tx_event_fifo::TxEventFifo<'static, Can0>;
 pub type Can0Aux<GclkId> = mcan::bus::Aux<
     'static,
     Can0,
-    Dependencies<Can0, GclkId, Can0Rx, Can0Tx, pac::Can0>,
+    Dependencies<Can0, GclkId, CanRx, CanTx, pac::Can0>,
 >;
