@@ -7,4 +7,4 @@
 /dataSources/
 /dataSources.local.xml
 
-src/can/data/*/**
+firmware/src/can/data/*/**
