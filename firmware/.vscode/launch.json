@@ -11,14 +11,13 @@
         },
         "runtimeExecutable": "/home/ashcon/.cargo/bin/probe-rs",
         "runtimeArgs": ["dap-server"],
-        "chip": "ATSAME51J20A",
+        "chip": "ATSAME54P20A",
         "wireProtocol": "Swd",
         "coreConfigs": [
           {
             "coreIndex": 0,
-            //!MODIFY
             "programBinary": "target/thumbv7em-none-eabihf/release/firmware",
-            "svdFile": "ATSAME51J20A.svd",
+            "svdFile": "ATSAME54P20A.svd",
             "rttEnabled": true
           }
         ],
