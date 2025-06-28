@@ -85,14 +85,14 @@ hal::bsp_pins!(
     PA14 {
         name: rpm_n3
         aliases: {
-            AlternateE: RpmN3
+            PushPullOutput: RpmN3
         }
     },
     // PA15 - NC
     PA16 {
         name: rpm_n2
         aliases: {
-            AlternateE: RpmN2
+            PushPullOutput: RpmN2
         }
     },
     // PA17 - NC
@@ -106,7 +106,8 @@ hal::bsp_pins!(
     PA20 {
         name: tle_clk
         aliases: {
-            PushPullOutput: TleClk
+            PushPullOutput: TleClk,
+            AlternateG: TleClkG
         }
     },
     PA21 {
@@ -169,13 +170,13 @@ hal::bsp_pins!(
     },
     // PB09 - NC
     PB10 {
-        name: ext_flash_sck
+        name: extflash_sck
         aliases: {
             AlternateH: ExtFlashSck
         }
     },
     PB11 {
-        name: ext_flash_cs
+        name: extflash_cs
         aliases: {
             AlternateH: ExtFlashCs
         }
@@ -399,7 +400,7 @@ pub fn ext_flash(
     qspi
 }
 
-pub type EepromPads = i2c::Pads<Sercom2, IoSet1, EepromSDA, EepromSCL>;
+pub type EepromPads = i2c::Pads<Sercom2, EepromSDA, EepromSCL>;
 pub type EepromI2c = i2c::I2c<i2c::Config<EepromPads>>;
 
 pub fn eeprom(
@@ -415,7 +416,7 @@ pub fn eeprom(
 }
 
 
-pub type TleSpiPads = spi::Pads<TleSercom, IoSet1, TleSo, TleSi, TleSck>;
+pub type TleSpiPads = spi::Pads<TleSercom, TleSo, TleSi, TleSck>;
 pub type TleSpi = spi::Spi<spi::Config<TleSpiPads>, spi::Duplex>;
 
 pub fn tle_spi<Gclk: GclkId>(

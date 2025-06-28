@@ -1,8 +1,10 @@
-use packed_struct::{derive::PackedStruct, PackedStruct};
+use core::fmt::Debug;
+
+use packed_struct::{derive::PackedStruct, PackedStruct, PackedStructSlice};
 
 use super::TleChannel;
 
-#[derive(PackedStruct, Default)]
+#[derive(PackedStruct, Default, Debug)]
 #[packed_struct(bit_numbering="lsb0", size_bytes="1")]
 pub struct MsgId {
     #[packed_field(bits="0..8")]
@@ -40,11 +42,12 @@ pub trait TleHeader: PackedStruct{}
 impl TleHeader for MsgId{}
 impl TleHeader for MsgIdWithChannel{}
 
-pub trait TleMessage: PackedStruct {
+pub trait TleMessage: PackedStruct + Debug {
+    type HEADER: TleHeader + PackedStruct;
     const MSG_ID: u8;
 }
 
-#[derive(PackedStruct, Default)]
+#[derive(PackedStruct, Default, Debug)]
 #[packed_struct(bit_numbering="lsb0", size_bytes="4")]
 pub struct TleMessagePayload {
     #[packed_field(bits="0..24")]
@@ -55,7 +58,7 @@ pub struct TleMessagePayload {
     pub r_w: bool
 }
 
-#[derive(PackedStruct, Default)]
+#[derive(PackedStruct, Default, Debug)]
 #[packed_struct(bit_numbering="lsb0", size_bytes="3")]
 pub struct ICVersion {
     #[packed_field(bits="8..16")]
@@ -66,9 +69,10 @@ pub struct ICVersion {
 
 impl TleMessage for ICVersion {
     const MSG_ID: u8 = 0;
+    type HEADER = MsgId;
 }
 
-#[derive(PackedStruct, Default)]
+#[derive(PackedStruct, Default, Debug)]
 #[packed_struct(bit_numbering="lsb0", size_bytes="3")]
 pub struct ControlMethodFaultMaskConfig {
     #[packed_field(bits="4..6")]
@@ -115,9 +119,10 @@ pub struct ControlMethodFaultMaskConfig {
 
 impl TleMessage for ControlMethodFaultMaskConfig {
     const MSG_ID: u8 = 1;
+    type HEADER = MsgId;
 }
 
-#[derive(PackedStruct, Default)]
+#[derive(PackedStruct, Default, Debug)]
 #[packed_struct(bit_numbering="lsb0", size_bytes="3")]
 pub struct DiagConfiguration0_3 {
     #[packed_field(bits="0..4")]
@@ -143,9 +148,10 @@ pub struct DiagConfiguration0_3 {
 
 impl TleMessage for DiagConfiguration0_3 {
     const MSG_ID: u8 = 2;
+    type HEADER = MsgId;
 }
 
-#[derive(PackedStruct, Default)]
+#[derive(PackedStruct, Default, Debug)]
 #[packed_struct(bit_numbering="lsb0", size_bytes="3")]
 pub struct DiagConfiguration4_7 {
     #[packed_field(bits="0..4")]
@@ -171,9 +177,10 @@ pub struct DiagConfiguration4_7 {
 
 impl TleMessage for DiagConfiguration4_7 {
     const MSG_ID: u8 = 3;
+    type HEADER = MsgId;
 }
 
-#[derive(PackedStruct, Default)]
+#[derive(PackedStruct, Default, Debug)]
 #[packed_struct(bit_numbering="lsb0", size_bytes="3")]
 pub struct DiagnosticRead0_3 {
     #[packed_field(bits="0")]
@@ -231,9 +238,10 @@ pub struct DiagnosticRead0_3 {
 
 impl TleMessage for DiagnosticRead0_3 {
     const MSG_ID: u8 = 4;
+    type HEADER = MsgId;
 }
 
-#[derive(PackedStruct, Default)]
+#[derive(PackedStruct, Default, Debug)]
 #[packed_struct(bit_numbering="lsb0", size_bytes="3")]
 pub struct DiagnosticRead4_7 {
     #[packed_field(bits="0")]
@@ -291,9 +299,10 @@ pub struct DiagnosticRead4_7 {
 
 impl TleMessage for DiagnosticRead4_7 {
     const MSG_ID: u8 = 5;
+    type HEADER = MsgId;
 }
 
-#[derive(PackedStruct, Default)]
+#[derive(PackedStruct, Default, Debug)]
 #[packed_struct(bit_numbering="lsb0", size_bytes="3")]
 pub struct PwmOffset0_3 {
     #[packed_field(bits="0..5")]
@@ -309,10 +318,11 @@ pub struct PwmOffset0_3 {
 
 impl TleMessage for PwmOffset0_3 {
     const MSG_ID: u8 = 6;
+    type HEADER = MsgId;
 }
 
 
-#[derive(PackedStruct, Default)]
+#[derive(PackedStruct, Default, Debug)]
 #[packed_struct(bit_numbering="lsb0", size_bytes="3")]
 pub struct PwmOffset4_7 {
     #[packed_field(bits="0..5")]
@@ -328,55 +338,59 @@ pub struct PwmOffset4_7 {
 
 impl TleMessage for PwmOffset4_7 {
     const MSG_ID: u8 = 7;
+    type HEADER = MsgId;
 }
 
 
-#[derive(PackedStruct, Default)]
+#[derive(PackedStruct, Default, Debug)]
 #[packed_struct(bit_numbering="lsb0", size_bytes="3")]
 pub struct MainPeriodSet {
-    #[packed_field(bits="0..14", endian="lsb")]
-    divider_n: u16,
+    #[packed_field(bits="0..14", endian="msb")]
+    pub divider_n: u16,
     #[packed_field(bits="14..16")]
-    divider_m: u8,
+    pub divider_m: u8,
     #[packed_field(bits="16")]
-    sam: bool,
+    pub sam: bool,
 }
 
 impl TleMessage for MainPeriodSet {
-    const MSG_ID: u8 = 8;
+    const MSG_ID: u8 = 1;
+    type HEADER = MsgIdWithChannel;
 }
 
 
-#[derive(PackedStruct, Default)]
+#[derive(PackedStruct, Default, Debug)]
 #[packed_struct(bit_numbering="lsb0", size_bytes="3")]
 pub struct ControlVariableSet {
-    #[packed_field(bits="0..12", endian="lsb")]
-    ki: u16,
-    #[packed_field(bits="12..24", endian="lsb")]
-    kp: u16,
+    #[packed_field(bits="0..12", endian="msb")]
+    pub ki: u16,
+    #[packed_field(bits="12..24", endian="msb")]
+    pub kp: u16,
 }
 
 impl TleMessage for ControlVariableSet {
-    const MSG_ID: u8 = 9;
+    const MSG_ID: u8 = 2;
+    type HEADER = MsgIdWithChannel;
 }
 
 
-#[derive(PackedStruct, Default)]
+#[derive(PackedStruct, Default, Debug)]
 #[packed_struct(bit_numbering="lsb0", size_bytes="3")]
 pub struct CurrentDitherAmplitudeSet {
-    #[packed_field(bits="0..11", endian="lsb")]
+    #[packed_field(bits="0..11", endian="msb")]
     pub current_setpoint: u16,
-    #[packed_field(bits="11..21", endian="lsb")]
+    #[packed_field(bits="11..21", endian="msb")]
     pub dither_step_size: u16,
     #[packed_field(bits="23")]
     pub en : bool
 }
 
 impl TleMessage for CurrentDitherAmplitudeSet {
-    const MSG_ID: u8 = 0b0011;
+    const MSG_ID: u8 = 3;
+    type HEADER = MsgIdWithChannel;
 }
 
-#[derive(PackedStruct, Default)]
+#[derive(PackedStruct, Default, Debug)]
 #[packed_struct(bit_numbering="lsb0", size_bytes="3")]
 pub struct DitherPeriodSet {
     #[packed_field(bits="0..5")]
@@ -384,10 +398,11 @@ pub struct DitherPeriodSet {
 }
 
 impl TleMessage for DitherPeriodSet {
-    const MSG_ID: u8 = 11;
+    const MSG_ID: u8 = 4;
+    type HEADER = MsgIdWithChannel;
 }
 
-#[derive(PackedStruct, Default)]
+#[derive(PackedStruct, Default, Debug)]
 #[packed_struct(bit_numbering="lsb0", size_bytes="3")]
 pub struct MaxMinCurrentRead {
     #[packed_field(bits="0..11", endian="lsb")]
@@ -399,23 +414,25 @@ pub struct MaxMinCurrentRead {
 }
 
 impl TleMessage for MaxMinCurrentRead {
-    const MSG_ID: u8 = 12;
+    const MSG_ID: u8 = 5;
+    type HEADER = MsgIdWithChannel;
 }
 
-#[derive(PackedStruct, Default)]
+#[derive(PackedStruct, Default, Debug)]
 #[packed_struct(bit_numbering="lsb0", size_bytes="3")]
 pub struct AvgCurrentRead {
-    #[packed_field(bits="0..20", endian="lsb")]
-    avg: u32,
+    #[packed_field(bits="0..20", endian="msb")]
+    pub avg: u32,
     #[packed_field(bits="20")]
-    valid: bool,
+    pub valid: bool,
 }
 
 impl TleMessage for AvgCurrentRead {
-    const MSG_ID: u8 = 13;
+    const MSG_ID: u8 = 6;
+    type HEADER = MsgIdWithChannel;
 }
 
-#[derive(PackedStruct, Default)]
+#[derive(PackedStruct, Default, Debug)]
 #[packed_struct(bit_numbering="lsb0", size_bytes="3")]
 pub struct AutoZeroTrigger {
     #[packed_field(bits="0..8")]
@@ -429,21 +446,23 @@ pub struct AutoZeroTrigger {
 }
 
 impl TleMessage for AutoZeroTrigger {
-    const MSG_ID: u8 = 14;
+    const MSG_ID: u8 = 7;
+    type HEADER = MsgIdWithChannel;
 }
 
-#[derive(PackedStruct, Default)]
+#[derive(PackedStruct, Default, Debug)]
 #[packed_struct(bit_numbering="lsb0", size_bytes="3")]
 pub struct PwmDutyCycle {
-    #[packed_field(bits="0..19", endian="lsb")]
-    pwm: u32,
+    #[packed_field(bits="0..19", endian="msb")]
+    pub pwm: u32,
 }
 
 impl TleMessage for PwmDutyCycle {
-    const MSG_ID: u8 = 15;
+    const MSG_ID: u8 = 8;
+    type HEADER = MsgIdWithChannel;
 }
 
-#[derive(PackedStruct, Default)]
+#[derive(PackedStruct, Default, Debug)]
 #[packed_struct(bit_numbering="lsb0", size_bytes="3")]
 pub struct CurrentProfileSetup1 {
     #[packed_field(bits="0..4")]
@@ -462,10 +481,11 @@ pub struct CurrentProfileSetup1 {
 }
 
 impl TleMessage for CurrentProfileSetup1 {
-    const MSG_ID: u8 = 16;
+    const MSG_ID: u8 = 9;
+    type HEADER = MsgIdWithChannel;
 }
 
-#[derive(PackedStruct, Default)]
+#[derive(PackedStruct, Default, Debug)]
 #[packed_struct(bit_numbering="lsb0", size_bytes="3")]
 pub struct CurrentProfileSetup2 {
     #[packed_field(bits="0..2")]
@@ -475,10 +495,11 @@ pub struct CurrentProfileSetup2 {
 }
 
 impl TleMessage for CurrentProfileSetup2 {
-    const MSG_ID: u8 = 17;
+    const MSG_ID: u8 = 10;
+    type HEADER = MsgIdWithChannel;
 }
 
-#[derive(PackedStruct, Default)]
+#[derive(PackedStruct, Default, Debug)]
 #[packed_struct(bit_numbering="lsb0", size_bytes="3")]
 pub struct CurrentProfileFeedback {
     #[packed_field(bits="0")]
@@ -490,10 +511,11 @@ pub struct CurrentProfileFeedback {
 }
 
 impl TleMessage for CurrentProfileFeedback {
-    const MSG_ID: u8 = 18;
+    const MSG_ID: u8 = 11;
+    type HEADER = MsgIdWithChannel;
 }
 
-#[derive(PackedStruct, Default)]
+#[derive(PackedStruct, Default, Debug)]
 #[packed_struct(bit_numbering="lsb0", size_bytes="3")]
 pub struct ReadGenericFlags {
     #[packed_field(bits="0")]
@@ -507,5 +529,6 @@ pub struct ReadGenericFlags {
 }
 
 impl TleMessage for ReadGenericFlags {
-    const MSG_ID: u8 = 19;
+    const MSG_ID: u8 = 15 << 3;
+    type HEADER = MsgId;
 }

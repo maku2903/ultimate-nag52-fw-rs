@@ -4,8 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-mcan = "0.5.0"
-atsamd-hal = {git="https://github.com/atsamd-rs/atsamd", branch="master", features=["same51j-rt", "can"] }
+mcan = "0.7.0"
+#atsamd-hal = {git="https://github.com/atsamd-rs/atsamd", branch="master", features=["same51j-rt", "can"] }
+atsamd-hal = {path="../../atsamd/hal", features=["same54p-rt", "can", "async", "dma", "usb"]}
+#atsamd-hal = {git="https://github.com/rnd-ash/atsamd", branch="adc_v2", features=["same54p-rt", "can", "async", "rtic", "dma", "usb"]}
 
 [package.metadata]
-chip = "ATSAME51J20A"
+chip = "ATSAME54P20A"

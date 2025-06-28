@@ -1,181 +1,202 @@
 #![no_std]
 #![no_main]
 
-use panic_rtt_target as _; // MUST HAVE for Panic (Crash) handling
+use core::{ops::DerefMut, sync::atomic::Ordering};
+use defmt_rtt as _;
 
-use atsamd_hal::{pac, rtc::rtic::rtc_clock, rtc_monotonic};
+use atsamd_hal::{clock::v2::{self, clock_system_at_reset, dfll::FromUsb, dpll::Dpll, gclk::{Gclk, GclkDiv16, GclkDiv8}, osculp32k::OscUlp32k, pclk::Pclk}, ehal::digital::{InputPin, OutputPin}, eic::{self, Eic, ExtInt}, gpio::{self, Disabled, Input, Interrupt, Pin, PullDown, PullDownInterrupt, PA16}, pac::{self}, qspi::{Command, Qspi}};
+use bsp::Pins;
+use cortex_m_rt::{entry};
+use embassy_executor::{raw::Executor, Spawner};
+use embassy_sync::{blocking_mutex::raw::NoopRawMutex, channel::Channel, mutex::Mutex};
+use embassy_time::{Delay, Duration, Instant, Ticker, Timer};
+use smoltcp::{iface::{PollResult, SocketSet}, socket::dhcpv4};
+use static_cell::StaticCell;
+use usbd_ethernet::DeviceState;
 
-mod tle8242;
-mod uart;
+use crate::{extern_flash::{ExternFlash, ScsiState, FAT_PARTITION}, os::*};
 
-pub use uart::*;
+//mod tle8242;
+mod extern_flash;
+mod os;
+mod usb;
+mod can;
 
-rtc_monotonic!(Mono, rtc_clock::Clock32k);
+//atsamd_hal::bind_multiple_interrupts!(struct Adc1Irqs {
+//    ADC1: [ADC1_RESRDY, ADC1_OTHER] => atsamd_hal::adc::InterruptHandler<Adc1>;
+//});
+//
+//atsamd_hal::bind_multiple_interrupts!(struct Adc0Irqs {
+//    ADC0: [ADC0_RESRDY, ADC0_OTHER] => atsamd_hal::adc::InterruptHandler<Adc0>;
+//});
 
-#[rtic::app(device = atsamd_hal::pac, peripherals = true, dispatchers = [EVSYS_0])]
-mod app {
-    use core::{sync::atomic::Ordering, time::Duration};
+#[entry]
+fn main() -> ! {
+    // CPU ENTRY
+    defmt::info!("CPU START!");
 
-    use super::*;
-    use atsamd_hal::{clock::{self, v2::{clock_system_at_reset, dpll::Dpll, gclk::{Gclk, GclkDiv16}, pclk::Pclk}, Tcc0Tcc1Clock}, nb, prelude::_atsamd_hal_embedded_hal_digital_v2_OutputPin, rtc::Rtc, sercom::spi::Flags, time::Hertz};
-    use fugit::{ExtU32, ExtU64};
-    use mcan::messageram::SharedMemory;
-    use bsp::{can_deps::Capacities, serial_uart, tle_spi, Pins, SolPwrEn, Uart};
-    use rtic_monotonics::Monotonic;
-    use rtic_sync::portable_atomic::{AtomicU32, AtomicU64};
-    use rtt_target::{rprintln, rtt_init_print};
-    use tle8242::{Tle8242, TleChannel};
-    use uart::Logger;
+    // 1. Configure clocks
+    let mut pac_peripherals = atsamd_hal::pac::Peripherals::take().unwrap();
+    let mut cortex = cortex_m::Peripherals::take().unwrap();
 
-    static SLEEP_TICKS: AtomicU64 = AtomicU64::new(0);
+    // Capture the reset reason
+    let rst_reason = pac_peripherals.rstc.rcause().read();
 
-    #[local]
-    struct LocalResources {
-        tle8242: Tle8242,
+    let pins = Pins::new(pac_peripherals.port);
+    let (mut buses, clocks, tokens) = clock_system_at_reset(
+        pac_peripherals.oscctrl,
+        pac_peripherals.osc32kctrl,
+        pac_peripherals.gclk,
+        pac_peripherals.mclk,
+        &mut pac_peripherals.nvmctrl,
+    );
+    // Steal PAC controller (We need mclk later)
+    let (_, _, _, mut mclk) = unsafe { clocks.pac.steal() };
+
+    // Obeying the max clock speeds for 125C operation,
+    // the processor clock setup shall be configured as follows
+    //
+    //     DFLL(48Mhz)
+    //     ├── GCLK1 (2Mhz)
+    //     │   ├── DPLL0(100Mhz)
+    //     C   │   └── GCLK0(100Mhz)
+    //     L   │       └── F_CPU
+    //     K   │           └── QSPI
+    //     │   └── DPLL1(160Mhz)
+    //     R       ├── GCLK2(40Mhz)
+    //     E       │   └── CAN0
+    //     C       ├── GCLK3(80Mhz)
+    //     O       │   ├── ADC0
+    //     V       │   ├── ADC1
+    //     E       │   ├── SERCOM(s)
+    //     R       │   └── EIC
+    //     Y       └── GCLK4(160Mhz)
+    //     │           └── TC/TCC(s)
+    //     └── GCLK6 (48Mhz)
+    //         └── USB                                    
+
+
+    // Take GCLK1 from DFLL48 and divide by 12 to get 2Mhz
+    let (gclk1, dfll) = Gclk::from_source(tokens.gclks.gclk1, clocks.dfll);
+    let gclk1 = gclk1.div(GclkDiv16::Div(24)).enable(); // Gclk1 is now at 2Mhz
+    // Now configure both DPLLs. (loop div values from ATMEL SMART)
+    // DPLL0 loop div 50 = 100Mhz
+    // DPLL1 loop div 80 = 160Mhz
+    let (clk_dpll0, gclk1) = Pclk::enable(tokens.pclks.dpll0, gclk1);
+    let (clk_dpll1, _gclk1) = Pclk::enable(tokens.pclks.dpll1, gclk1);
+    // DPLL0 at 100Mhz (2*50)
+    let dpll0 = Dpll::from_pclk(tokens.dpll0, clk_dpll0)
+        .loop_div(50, 0)
+        .enable();
+    // DPLL1 at 160Mhz (2x80)
+    let dpll1 = Dpll::from_pclk(tokens.dpll1, clk_dpll1)
+        .loop_div(80, 0)
+        .enable();
+    // Now swap GCLK0 so it is using DPLL0 as a reference rather than DFLL
+    let (gclk0_100, dfll, _dpll0) = clocks.gclk0.swap_sources(dfll, dpll0);
+    // Enable GCLK2 at 40Mhz (160/(4))
+    let (gclk2, dpll1) = Gclk::from_source(tokens.gclks.gclk2, dpll1);
+    let gclk2_40 = gclk2.div(GclkDiv8::Div(4)).enable();
+    // Enable GCLK3 at 80Mhz (160/(2))
+    let (gclk3, dpll1) = Gclk::from_source(tokens.gclks.gclk3, dpll1);
+    let gclk3_80 = gclk3.div(GclkDiv8::Div(2)).enable();
+    // Enable GCLK4 at 160Mhz (Match DPLL1 freq)
+    let (gclk4, _dpll1) = Gclk::from_source(tokens.gclks.gclk4, dpll1);
+    let gclk4_160 = gclk4.enable();
+
+    // Start the systick driver (Now CPU runs at 100Mhz)
+    os_start();
+
+    let executor = EXECUTOR_THREAD_LOW.init(Executor::new(usize::MAX as *mut ()));
+    let spawner_thread = SPAWNER_THREAD.init(executor.spawner());
+
+    if rst_reason.wdt().bit_is_set() {
+        panic!("CPU previously Reset due to watchdog! - Cpu halted");
     }
 
-    #[shared]
-    struct SharedResources {
+    // Switch DFLL to running with USB Clock recovery
+    let (dfll_usb, _old_mode)= dfll.into_mode(FromUsb, |dfll| {
+    });
+    let (gclk6, _dfll) = Gclk::from_source(tokens.gclks.gclk6, dfll_usb);
+    let gclk6_48 = gclk6.enable();
+    let (pclk_usb, _gclk6_48) = Pclk::enable(tokens.pclks.usb, gclk6_48);
+    // Setup the peripherals (Just the peripherals, not their usage)
+    usb::usb_init(pac_peripherals.usb, pclk_usb, &mut mclk, pins.usb_dp, pins.usb_dm, &mut cortex.NVIC, pins.led_usb);
 
+    // EVSYS
+    //let evsys = EvSysController::new(&mut mclk, pac_peripherals.evsys);
+    //let evsys_channels = evsys.split(); // Split into 32 channels
+
+    // EIC
+    let (osculp32k, base) = OscUlp32k::enable(tokens.osculp32k.osculp32k, clocks.osculp32k_base);
+    let gclk_7_32k = Gclk::from_source(tokens.gclks.gclk7, osculp32k).0.enable();
+    let (eic_clock, gclk_7_32k) = Pclk::enable(tokens.pclks.eic, gclk_7_32k);
+    //let mut eic = Eic::new(&mut mclk, (&eic_clock).into(), pac_peripherals.eic);
+
+    let (token, _) = eic_clock.disable(gclk_7_32k);
+    let (pclk_eic_fast, gclk0_100) = Pclk::enable(token, gclk0_100);
+
+    //eic.switch_to_gclk(&pclk_eic_fast);
+
+
+    //let eic_channels = eic.split();
+    //let mut n2_rpm = eic_channels.0.with_pin(pins.rpm_n2.into_pull_down_interrupt()); // EIC T[16]
+
+    //let n2_with_isr: gpio::Pin<_, PullDownInterrupt> = pins.rpm_n2.into();
+    //let n2_rpm = eic_channels.0.with_pin(n2_with_isr); // EIC T[0]
+    
+    //n2_rpm.enable_interrupt();
+    //n2_rpm.sense(pac::eic::config::Sense0select::Fall);
+    //n2_rpm.filter(true);
+    //n2_rpm.debounce();
+    //n3_rpm.sense(pac::eic::config::Sense0select::Rise);
+    //let rpm_1 = eic_channels.8.with_pin(pins.rpm_1); // EIC T[8] - Extra RPM sensor/Output shaft sensor
+    //let rpm_2 = eic_channels.6.with_pin(pins.rpm_2); // EIC T[6] - Extra RPM sensor
+
+    //let (_n2_rpm, n2_rpm_evsys) = n2_rpm.enable_event(evsys_channels.0);
+    //let (mut n2_rpm, n3_rpm_evsys) = n2_rpm.enable_event(evsys_channels.1);
+    //let (_rpm1, rpm1_rpm_evsys) = rpm_1.enable_event(evsys_channels.2);
+    //let (_rpm2, rpm2_rpm_evsys) = rpm_2.enable_event(evsys_channels.3);
+
+    let (pclk_tc2_tc3, gclk4_160) = Pclk::enable(tokens.pclks.tc2_tc3, gclk4_160);
+    //let pulse_counter_n2: PulseCounter<Tc2PulseCounter, evsys::Ch1, eic::Ch0> = PulseCounterBuilder::default().build(pac_peripherals.tc2, &pclk_tc2_tc3, &mut mclk, n3_rpm_evsys);
+
+    // QSPI
+    let qspi = Qspi::new(&mut mclk, pac_peripherals.qspi, pins.extflash_sck, pins.extflash_cs, pins.extflash_data0, pins.extflash_data1, pins.extflash_data2, pins.extflash_data3);
+    let flash = ExternFlash::new(qspi, pins.led_ext_flash.into());
+
+    let mut sensor_pwr = pins.sensor_pwr_en.into_push_pull_output();
+    sensor_pwr.set_high().unwrap();
+
+
+    os_launch_internal_tasks(&spawner_thread, pac_peripherals.wdt);
+    // Launch the async Initializing task for the TCU
+    spawner_thread.must_spawn(initialize_async(spawner_thread, flash));
+    //spawner_thread.must_spawn(monitor_pulse_counters(pulse_counter_n2, n2_rpm)); //, 
+    // Now OS is running, this loop keeps embassy running
+
+
+    loop {
+        let before = Instant::now().as_ticks();
+        cortex_m::asm::wfi();
+        let after = Instant::now().as_ticks();
+        SLEEP_TICKS.fetch_add(after - before, Ordering::Relaxed);
+        unsafe { executor.poll() };
     }
+}
 
-    #[init(local=[
-        #[link_section = ".can"]
-        can_memory0: SharedMemory<Capacities> = SharedMemory::new()
-        #[link_section = ".can"]
-        can_memory1: SharedMemory<Capacities> = SharedMemory::new()
-    ])]
-    fn init(mut cx: init::Context) -> (SharedResources, LocalResources) {
-        rtt_init_print!();
+use pac::interrupt;
 
-        cx.device.osc32kctrl.rtcctrl()
-            .write(|w| w.rtcsel().ulp32k());
+#[interrupt]
+fn EIC_EXTINT_0() {
+    defmt::info!("EIC INTERRUPT");
+}
 
-        Mono::start(cx.device.rtc); // Start this immedietly
-        let pins = Pins::new(cx.device.port);
-        let (_buses, clocks, tokens) = clock_system_at_reset(
-            cx.device.oscctrl,
-            cx.device.osc32kctrl,
-            cx.device.gclk,
-            cx.device.mclk,
-            &mut cx.device.nvmctrl,
-        );
-        // Steal PAC controller (We need mclk later)
-        let (_, _, _, mut mclk) = unsafe { clocks.pac.steal() };
-
-        // Configure CPU to run at 100Mhz
-        let (gclk1, dfll) = Gclk::from_source(tokens.gclks.gclk1, clocks.dfll);
-        let gclk1 = gclk1.div(GclkDiv16::Div(24)).enable();
-
-        // Setup a peripheral channel to power up `Dpll0` from `Gclk1`
-        let (pclk_dpll0, gclk1) = Pclk::enable(tokens.pclks.dpll0, gclk1);
-
-        // Configure `Dpll0` with `2 * 50 + 0/32 = 100 MHz` frequency
-        let dpll0 = Dpll::from_pclk(tokens.dpll0, pclk_dpll0)
-            .loop_div(50, 0)
-            .enable();
-
-        // Swap source of `Gclk0` from Dfll to Dpll0, `48 Mhz -> 100 MHz`
-        let (gclk0, _dfll, _dpll0) = clocks.gclk0.swap_sources(dfll, dpll0);
-
-        let (pclk_sercom2, gclk0) = Pclk::enable(tokens.pclks.sercom2, gclk0);
-        let (pclk_sercom5, gclk0) = Pclk::enable(tokens.pclks.sercom5, gclk0);
-
-        let (tcc0tcc1clock, gclk0) = Pclk::enable(tokens.pclks.tcc0_tcc1, gclk0);
-        
-        let mut sol_pwr_en: SolPwrEn = pins.sol_pwr_en.into();
-        sol_pwr_en.set_drive_strength(true);
-        sol_pwr_en.set_high().unwrap();
-
-        let spi = tle_spi(
-            pclk_sercom2, 
-            Hertz::MHz(20), 
-            cx.device.sercom2, 
-            &mut mclk, 
-            pins.tle_sclk, 
-            pins.tle_si,        
-            pins.tle_so,
-        );
-
-        let uart = serial_uart(
-            pclk_sercom5, 
-            Hertz::Hz(115200), 
-            cx.device.sercom5, 
-            &mut mclk, 
-            pins.uart_rx, 
-            pins.uart_tx
-        );
-
-        Logger::init(
-            uart,
-            cx.device.dmac,
-            &mut cx.device.pm,
-            LogLevel::Debug
-        );
-        let tle8242 = Tle8242::new(
-            spi,
-            &mut cx.device.pm,
-            pins.tle_clk,
-            pins.tle_reset,
-            pins.tle_cs,
-            &tcc0tcc1clock.into(), 
-            cx.device.tcc1, 
-            &mut mclk
-        );
-
-        // SPI to TLE8242
-        //let spi = bsp::tle_spi(pclk_sercom0, baud, sercom, &mut mclk, sclk, mosi, miso);
-        query_tle::spawn();
-        cpu_usage::spawn();
-        (SharedResources{}, LocalResources{
-            tle8242
-        })
-    }
-
-    #[task(priority=1, local=[tle8242])]
-    async fn query_tle(ctx: query_tle::Context) {
-        let query = ctx.local.tle8242.read_version_info().await;
-        //let query = ctx.local.tle8242.read_control_method().await;
-        //let query = ctx.local.tle8242.read_version_info().await;
-        //let query = ctx.local.tle8242.set_current(TleChannel::_3, 500).await;
-        //let query = ctx.local.tle8242.read_version_info().await;
-        //loop {
-
-            //let query = ctx.local.tle8242.read_version_info(TleChannel::_3, 500).await;
-            //if let Some(q) = query {
-            //    rprintln!("Version: {:08b} Manf.ID: {:08b}",q.version, q.ic_manf_id);
-            //}
-
-            //ctx.local.tle8242.send_command(0).await;
-            //Mono::delay(20u32.millis()).await
-        //}
-        //ctx.local.tle8242.read_version_info().await.unwrap();
-        //for i in 20..31 {
-        //    rprintln!("{}", i);
-        //    let x = 1u32 << i;
-        //    ctx.local.tle8242.test(x).await;
-        //    Mono::delay(20u32.millis()).await
-        //}
-        rprintln!("Done");
-        if let Some(q) = query {
-            log_debug!("Version: {:08b} Manf.ID: {:08b}",q.version, q.ic_manf_id);
-        }
-        log_debug!("Test debug msg!");
-        log_info!("Test info msg!");
-        log_warn!("Test warn msg!");
-        log_error!("Test error msg!");
-    }
-
-    #[task(priority=1)]
-    async fn cpu_usage(mut cx: cpu_usage::Context) {
-        let mut previous_tick = 0u64;
-        loop {
-            let events = SLEEP_TICKS.swap(0, Ordering::Relaxed);
-            log_warn!("Cpu events: {}", events);
-            Mono::delay(1000u64.millis()).await;
-        }
-    }
-
-
-
+#[embassy_executor::task]
+/// Start the TCU up with an async method, so we can do multiple things in parallel
+/// (Like initializing EEPROM/QSPI whilst also initializing the TLE8242)
+pub async fn initialize_async(spawner: &'static Spawner, mut flash: ExternFlash) {
+    flash.init().await;
+    let parts = flash.into_partitions();
+    let _ = FAT_PARTITION.init(Mutex::new((parts.usb_fat32, ScsiState::default())));
 }

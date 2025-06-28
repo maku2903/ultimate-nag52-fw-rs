@@ -1,0 +1,18 @@
+[package]
+name = "candb_codegen"
+version = "0.1.0"
+edition = "2021"
+
+
+[lib]
+name = "candb_codegen"
+path = "src/lib.rs"
+
+[[bin]]
+name = "candb_codegen"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5.31", features = ["derive"] }
+convert_case = "0.8.0"
+nom = "8.0.0"
