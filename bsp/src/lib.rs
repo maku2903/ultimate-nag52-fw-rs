@@ -1,17 +1,30 @@
 #![no_std]
 
-use atsamd_hal::{can::Dependencies, clock::v2::{gclk::{Gclk0Id, GclkId}, pclk::Pclk, types::Usb}, ehal::digital::OutputPin, pac::{self, Mclk}, qspi::{self, OneShot, Qspi}, sercom::{i2c::{self, I2c}, spi, uart::{self, BaudMode, Oversampling}, IoSet1, IoSet3, IoSet4, Sercom0, Sercom2, Sercom4, Sercom5, Sercom6}, time::Hertz, usb::{self, UsbBus}};
-pub use atsamd_hal as hal;
+use atsamd_hal::{
+    clock::v2::{
+        gclk::GclkId,
+        pclk::Pclk,
+        types::Usb,
+    },
+    pac::{self, Mclk},
+    qspi::{self, Qspi},
+    sercom::{
+        i2c::{self},
+        spi, Sercom2, Sercom6,
+    },
+    time::Hertz,
+    usb::{self, UsbBus},
+};
 
 pub mod can_deps;
 
-hal::bsp_peripherals!(
+atsamd_hal::bsp_peripherals!(
     Sercom0 { KlineSercom }
     Sercom2 { EepromSercom }
     Sercom6 { TleSercom }
 );
 
-hal::bsp_pins!(
+atsamd_hal::bsp_pins!(
     // -- PORT A -- //
     // PA00 - NC
     // PA01 - NC
@@ -147,7 +160,12 @@ hal::bsp_pins!(
         }
     },
     // PA30 - DBG
-    // PA31 - DBG
+    PA31 {
+        // Special pin (Usually debug)
+        // but the bootloader uses it to check
+        // if it should stay in loader mode
+        name: bootloader_check
+    }
     // -- PORT B -- //
     // PB00 - NC
     // PB01 - NC
@@ -411,10 +429,8 @@ pub fn eeprom(
     scl: impl Into<EepromSCL>,
 ) -> EepromI2c {
     let pads = i2c::Pads::new(sda.into(), scl.into());
-    i2c::Config::new(mclk, sercom, pads, baud)
-        .enable()
+    i2c::Config::new(mclk, sercom, pads, baud).enable()
 }
-
 
 pub type TleSpiPads = spi::Pads<TleSercom, TleSo, TleSi, TleSck>;
 pub type TleSpi = spi::Spi<spi::Config<TleSpiPads>, spi::Duplex>;
@@ -435,10 +451,7 @@ pub fn tle_spi<Gclk: GclkId>(
     let mut sck: TleSck = sck.into();
     sck.set_drive_strength(false);
 
-    let pads = spi::Pads::default()
-        .data_in(so)
-        .data_out(si)
-        .sclk(sck);
+    let pads = spi::Pads::default().data_in(so).data_out(si).sclk(sck);
     spi::Config::new(mclk, sercom, pads, pclk_sercom0.freq())
         .baud(baud)
         .spi_mode(spi::MODE_0)
@@ -446,13 +459,12 @@ pub fn tle_spi<Gclk: GclkId>(
         .enable()
 }
 
-
 pub fn native_usb<Gclk: GclkId>(
     clock: Pclk<Usb, Gclk>,
     usb: pac::Usb,
     mclk: &mut Mclk,
     dp: impl Into<UsbDp>,
-    dm: impl Into<UsbDm>
+    dm: impl Into<UsbDm>,
 ) -> UsbBus {
     usb::UsbBus::new(&clock.into(), mclk, dm.into(), dp.into(), usb)
 }
