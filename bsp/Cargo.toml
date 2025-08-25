@@ -5,9 +5,12 @@ edition = "2021"
 
 [dependencies]
 mcan = "0.7.0"
-#atsamd-hal = {git="https://github.com/atsamd-rs/atsamd", branch="master", features=["same51j-rt", "can"] }
-atsamd-hal = {path="../../atsamd/hal", features=["same54p-rt", "can", "async", "dma", "usb"]}
-#atsamd-hal = {git="https://github.com/rnd-ash/atsamd", branch="adc_v2", features=["same54p-rt", "can", "async", "rtic", "dma", "usb"]}
+atsamd-hal = {workspace=true, features=[]}
+
+# Patch USB-Device crate to support custom Descriptor buffer size, and Support setting USB Spec V1.0/1.1
+[patch.crates-io]
+usb-device = { git = "https://github.com/rust-embedded-community/usb-device", rev = "a6e6c9115c54fa18c11f41c6a8fcb98dd700912b" }
 
 [package.metadata]
 chip = "ATSAME54P20A"
+

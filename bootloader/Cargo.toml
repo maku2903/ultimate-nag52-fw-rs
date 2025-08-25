@@ -3,4 +3,36 @@ name = "bootloader"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "bootloader"
+path = "src/lib.rs"
+
 [dependencies]
+bsp = { path = "../bsp" }
+atsamd-hal = { workspace = true, features = ["same54p-rt", "can", "usb"] }
+cortex-m-rt.workspace = true
+cortex-m.workspace = true
+mcan.workspace = true
+konst = "0.4.1"
+defmt = "1.0.1"
+defmt-rtt = "1.0.0"
+compile-time = "0.2.0"
+systick-timer = { version = "0.1.1", features = ["cortex-m"] }
+automotive_diag = { version = "0.1.21", default-features = false, features = [
+    "kwp2000",
+] }
+usbd-serial = "0.2.2"
+embedded-crc32c = "0.1.0"
+static_cell = "2.1.1"
+
+[build-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["now"] }
+rustc_version = "0.4.1"
+
+[features]
+skip_flash_sig_check = []
+stay-in-bootloader = []
+
+# For cargo flash
+[package.metadata]
+chip = "ATSAME54P20A"
