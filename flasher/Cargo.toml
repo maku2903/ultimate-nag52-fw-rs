@@ -4,5 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-clap = { version = "4.5.29", features = ["derive"] }
-probe-rs = "0.27.0"
+env_logger="*"
+log="0.4.27"
+clap = { version = "4.5.45", features = ["derive"] }
+color-eyre = "0.6.5"
+console = "0.16.0"
+ecu_diagnostics = "0.99.0"
+embedded-crc32c = "0.1.0"
+indicatif = "0.18.0"
+object = "0.37.3"
+serial-rs = "0.2.1"
+clap-num = "1.2.0"
