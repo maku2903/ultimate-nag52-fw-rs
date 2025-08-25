@@ -1,4 +1,7 @@
-use core::{panic::PanicInfo, sync::atomic::{compiler_fence, Ordering}};
+use core::{
+    panic::PanicInfo,
+    sync::atomic::{compiler_fence, Ordering},
+};
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {

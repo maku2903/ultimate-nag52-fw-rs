@@ -1,26 +1,42 @@
 #![no_std]
 #![no_main]
 
-use core::{ops::DerefMut, sync::atomic::Ordering};
+pub use bsp::hal as atsamd_hal;
+use core::sync::atomic::Ordering;
+use cortex_m::asm::nop;
+use defmt::warn;
 use defmt_rtt as _;
 
-use atsamd_hal::{clock::v2::{self, clock_system_at_reset, dfll::FromUsb, dpll::Dpll, gclk::{Gclk, GclkDiv16, GclkDiv8}, osculp32k::OscUlp32k, pclk::Pclk}, ehal::digital::{InputPin, OutputPin}, eic::{self, Eic, ExtInt}, gpio::{self, Disabled, Input, Interrupt, Pin, PullDown, PullDownInterrupt, PA16}, pac::{self}, qspi::{Command, Qspi}};
+use atsamd_hal::{
+    clock::v2::{
+        clock_system_at_reset,
+        dfll::FromUsb,
+        dpll::Dpll,
+        gclk::{Gclk, GclkDiv16, GclkDiv8},
+        osculp32k::OscUlp32k,
+        pclk::Pclk,
+    },
+    ehal::digital::OutputPin,
+    pac::{self},
+    qspi::Qspi,
+};
 use bsp::Pins;
-use cortex_m_rt::{entry};
+use cortex_m_rt::entry;
 use embassy_executor::{raw::Executor, Spawner};
-use embassy_sync::{blocking_mutex::raw::NoopRawMutex, channel::Channel, mutex::Mutex};
-use embassy_time::{Delay, Duration, Instant, Ticker, Timer};
-use smoltcp::{iface::{PollResult, SocketSet}, socket::dhcpv4};
-use static_cell::StaticCell;
-use usbd_ethernet::DeviceState;
+use embassy_sync::mutex::Mutex;
+use embassy_time::{Instant, Timer};
 
-use crate::{extern_flash::{ExternFlash, ScsiState, FAT_PARTITION}, os::*};
+use crate::{
+    extern_flash::{ExternFlash, ScsiState, FAT_PARTITION},
+    os::*,
+};
 
 //mod tle8242;
+mod app_info;
+mod can;
 mod extern_flash;
 mod os;
 mod usb;
-mod can;
 
 //atsamd_hal::bind_multiple_interrupts!(struct Adc1Irqs {
 //    ADC1: [ADC1_RESRDY, ADC1_OTHER] => atsamd_hal::adc::InterruptHandler<Adc1>;
@@ -33,7 +49,6 @@ mod can;
 #[entry]
 fn main() -> ! {
     // CPU ENTRY
-    defmt::info!("CPU START!");
 
     // 1. Configure clocks
     let mut pac_peripherals = atsamd_hal::pac::Peripherals::take().unwrap();
@@ -43,7 +58,7 @@ fn main() -> ! {
     let rst_reason = pac_peripherals.rstc.rcause().read();
 
     let pins = Pins::new(pac_peripherals.port);
-    let (mut buses, clocks, tokens) = clock_system_at_reset(
+    let (buses, clocks, tokens) = clock_system_at_reset(
         pac_peripherals.oscctrl,
         pac_peripherals.osc32kctrl,
         pac_peripherals.gclk,
@@ -52,6 +67,8 @@ fn main() -> ! {
     );
     // Steal PAC controller (We need mclk later)
     let (_, _, _, mut mclk) = unsafe { clocks.pac.steal() };
+
+    defmt::info!("CPU START!");
 
     // Obeying the max clock speeds for 125C operation,
     // the processor clock setup shall be configured as follows
@@ -73,15 +90,14 @@ fn main() -> ! {
     //     Y       └── GCLK4(160Mhz)
     //     │           └── TC/TCC(s)
     //     └── GCLK6 (48Mhz)
-    //         └── USB                                    
-
+    //         └── USB
 
     // Take GCLK1 from DFLL48 and divide by 12 to get 2Mhz
     let (gclk1, dfll) = Gclk::from_source(tokens.gclks.gclk1, clocks.dfll);
     let gclk1 = gclk1.div(GclkDiv16::Div(24)).enable(); // Gclk1 is now at 2Mhz
-    // Now configure both DPLLs. (loop div values from ATMEL SMART)
-    // DPLL0 loop div 50 = 100Mhz
-    // DPLL1 loop div 80 = 160Mhz
+                                                        // Now configure both DPLLs. (loop div values from ATMEL SMART)
+                                                        // DPLL0 loop div 50 = 100Mhz
+                                                        // DPLL1 loop div 80 = 160Mhz
     let (clk_dpll0, gclk1) = Pclk::enable(tokens.pclks.dpll0, gclk1);
     let (clk_dpll1, _gclk1) = Pclk::enable(tokens.pclks.dpll1, gclk1);
     // DPLL0 at 100Mhz (2*50)
@@ -109,19 +125,26 @@ fn main() -> ! {
 
     let executor = EXECUTOR_THREAD_LOW.init(Executor::new(usize::MAX as *mut ()));
     let spawner_thread = SPAWNER_THREAD.init(executor.spawner());
-
-    if rst_reason.wdt().bit_is_set() {
-        panic!("CPU previously Reset due to watchdog! - Cpu halted");
-    }
+    //warn!("{:032b}", rst_reason.bits());
+    //if rst_reason.wdt().bit_is_set() {
+    //    defmt::panic!("CPU previously Reset due to watchdog! - Cpu halted");
+    //}
 
     // Switch DFLL to running with USB Clock recovery
-    let (dfll_usb, _old_mode)= dfll.into_mode(FromUsb, |dfll| {
-    });
+    let (dfll_usb, _old_mode) = dfll.into_mode(FromUsb, |dfll| {});
     let (gclk6, _dfll) = Gclk::from_source(tokens.gclks.gclk6, dfll_usb);
     let gclk6_48 = gclk6.enable();
     let (pclk_usb, _gclk6_48) = Pclk::enable(tokens.pclks.usb, gclk6_48);
     // Setup the peripherals (Just the peripherals, not their usage)
-    usb::usb_init(pac_peripherals.usb, pclk_usb, &mut mclk, pins.usb_dp, pins.usb_dm, &mut cortex.NVIC, pins.led_usb);
+    usb::usb_init(
+        pac_peripherals.usb,
+        pclk_usb,
+        &mut mclk,
+        pins.usb_dp,
+        pins.usb_dm,
+        &mut cortex.NVIC,
+        pins.led_usb,
+    );
 
     // EVSYS
     //let evsys = EvSysController::new(&mut mclk, pac_peripherals.evsys);
@@ -138,13 +161,12 @@ fn main() -> ! {
 
     //eic.switch_to_gclk(&pclk_eic_fast);
 
-
     //let eic_channels = eic.split();
     //let mut n2_rpm = eic_channels.0.with_pin(pins.rpm_n2.into_pull_down_interrupt()); // EIC T[16]
 
     //let n2_with_isr: gpio::Pin<_, PullDownInterrupt> = pins.rpm_n2.into();
     //let n2_rpm = eic_channels.0.with_pin(n2_with_isr); // EIC T[0]
-    
+
     //n2_rpm.enable_interrupt();
     //n2_rpm.sense(pac::eic::config::Sense0select::Fall);
     //n2_rpm.filter(true);
@@ -162,23 +184,46 @@ fn main() -> ! {
     //let pulse_counter_n2: PulseCounter<Tc2PulseCounter, evsys::Ch1, eic::Ch0> = PulseCounterBuilder::default().build(pac_peripherals.tc2, &pclk_tc2_tc3, &mut mclk, n3_rpm_evsys);
 
     // QSPI
-    let qspi = Qspi::new(&mut mclk, pac_peripherals.qspi, pins.extflash_sck, pins.extflash_cs, pins.extflash_data0, pins.extflash_data1, pins.extflash_data2, pins.extflash_data3);
+    let qspi = Qspi::new(
+        &mut mclk,
+        pac_peripherals.qspi,
+        pins.extflash_sck,
+        pins.extflash_cs,
+        pins.extflash_data0,
+        pins.extflash_data1,
+        pins.extflash_data2,
+        pins.extflash_data3,
+    );
+
+    //let apb_qspi = clocks.apbs.qspi;
+    //let ahb_qspi = clocks.ahbs.qspi;
+    //let (qspi, gclk0_100) = QspiBuilder::new(
+    //    pins.extflash_sck,
+    //    pins.extflash_cs,
+    //    pins.extflash_data0,
+    //    pins.extflash_data1,
+    //    pins.extflash_data2,
+    //    pins.extflash_data3,
+    //)
+    //.with_freq(50_000_000)
+    //.with_mode(atsamd_hal::qspi::QspiMode::_0)
+    //.build(pac_peripherals.qspi, ahb_qspi, apb_qspi, gclk0_100)
+    //.unwrap();
+
     let flash = ExternFlash::new(qspi, pins.led_ext_flash.into());
 
     let mut sensor_pwr = pins.sensor_pwr_en.into_push_pull_output();
     sensor_pwr.set_high().unwrap();
 
-
     os_launch_internal_tasks(&spawner_thread, pac_peripherals.wdt);
     // Launch the async Initializing task for the TCU
     spawner_thread.must_spawn(initialize_async(spawner_thread, flash));
-    //spawner_thread.must_spawn(monitor_pulse_counters(pulse_counter_n2, n2_rpm)); //, 
+    //spawner_thread.must_spawn(monitor_pulse_counters(pulse_counter_n2, n2_rpm)); //,
     // Now OS is running, this loop keeps embassy running
-
 
     loop {
         let before = Instant::now().as_ticks();
-        cortex_m::asm::wfi();
+        cortex_m::asm::wfe();
         let after = Instant::now().as_ticks();
         SLEEP_TICKS.fetch_add(after - before, Ordering::Relaxed);
         unsafe { executor.poll() };

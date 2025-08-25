@@ -5,7 +5,7 @@ mod defmt_timestamp;
 
 use core::sync::atomic::{AtomicU16, Ordering};
 
-use atsamd_hal::{interrupt::{self, InterruptExt, Priority}, pac::{Peripherals, Wdt}, watchdog};
+use crate::atsamd_hal::{pac::Wdt, watchdog};
 use cortex_m_rt::exception;
 use embassy_executor::{raw::Executor, InterruptExecutor, SendSpawner, Spawner};
 use embassy_sync::once_lock::OnceLock;

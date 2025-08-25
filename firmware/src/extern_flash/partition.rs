@@ -1,6 +1,6 @@
-use core::{cell::RefCell, ops::{DerefMut, Range, RangeInclusive}};
+use core::ops::DerefMut;
 
-use embassy_sync::blocking_mutex::{raw::CriticalSectionRawMutex, CriticalSectionMutex};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
 use crate::extern_flash::{ExternFlash};
 
