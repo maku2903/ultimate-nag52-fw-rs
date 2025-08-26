@@ -1,5 +1,6 @@
 use std::{fs, path::PathBuf, thread::sleep, time::{Duration, Instant}};
 
+use chrono::{Datelike, Utc};
 use clap::*;
 use clap_num::maybe_hex;
 use console::style;
@@ -24,6 +25,11 @@ pub enum Interface {
 
 #[derive(Subcommand, Clone)]
 pub enum Command {
+    /// Read out ECU identification
+    Ident,
+    /// Burn production date into the ECU
+    /// THIS CAN ONLY BE PERFORMED ONCE!
+    BurnDate,
     /// Flash an application binary to the TCU
     Flash { file: PathBuf },
     /// Read / Dump memory from the TCU to a binary file
@@ -286,6 +292,27 @@ fn flash(mp: &MultiProgress, file: PathBuf, server: DynamicDiagSession, fast_mod
     Ok(())
 }
 
+fn ident(server: DynamicDiagSession) -> Result<(), Report> {
+    if let Ok(ident) = server.kwp_read_daimler_identification() {
+        println!("{ident:#?}");
+    }
+    let ident = server.kwp_read_daimler_mmc_identification()?;
+    println!("{ident:#?}");
+    Ok(())
+}
+
+fn burn_date(server: DynamicDiagSession) -> Result<(), Report> {
+    server.kwp_set_session(KwpSessionType::Reprogramming.into())?;
+    let date = Utc::now();
+    let mut req = [KwpCommand::StartRoutineByLocalIdentifier as u8, 0x24, 0,0,0,0];
+    req[2] = date.day() as u8; // Day
+    req[3] = date.iso_week().week() as u8; // Week
+    req[4] = date.month() as u8; // Month
+    req[5] = (date.year() % 100) as u8; // Year
+    server.send_byte_array_with_response(&req)?;
+    println!("Burnt production date: {}/{}/{} (Week {})", req[2], req[4], req[5],  req[3]);
+    Ok(())
+}
 
 fn main() -> Result<()> {
     env_logger::init();
@@ -316,6 +343,12 @@ fn main() -> Result<()> {
         Command::Read { start_address, end_address, output_file } => {
             read(&mp, output_file, start_address, end_address, server, fast_mode)
         },
+        Command::Ident => {
+            ident(server)
+        }
+        Command::BurnDate => {
+            burn_date(server)
+        }
     };
     if res.is_err() {
         mp.clear()?;
