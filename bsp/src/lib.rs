@@ -376,6 +376,7 @@ atsamd_hal::bsp_pins!(
         name: led_status
         aliases: {
             PushPullOutput: LedStatus
+            AlternateF: PulsingStatus
         }
     },
     PD09 {

@@ -8,9 +8,10 @@ use atsamd_hal::{
 };
 pub use automotive_diag::kwp2000::*;
 use cortex_m::{asm::delay, peripheral::SCB};
+use defmt::println;
 
 use crate::{
-    bl_info::{self, app_crc, APP_ADDR_END, APP_ADDR_START},
+    bl_info::{self, app_crc, get_bootloader_info, APP_ADDR_END, APP_ADDR_START},
     isotp::{BS_EGS, ST_MIN_EGS},
 };
 
@@ -238,6 +239,7 @@ impl KwpServer {
                 Some(KwpCommand::TesterPresent) => self.tester_present(cmd),
                 Some(KwpCommand::RequestTransferExit) => self.transfer_exit(cmd),
                 Some(KwpCommand::StartRoutineByLocalIdentifier) => self.routine_start(cmd),
+                Some(KwpCommand::ReadECUIdentification) => self.ecu_ident(cmd),
                 Some(KwpCommand::RequestRoutineResultsByLocalIdentifier) => {
                     self.routine_results(cmd)
                 }
@@ -326,6 +328,63 @@ impl KwpServer {
         }
     }
 
+    fn ecu_ident(&mut self, cmd: &[u8]) -> ServerResult {
+        if cmd.len() != 2 {
+            // 1 byte for ID type
+            Err(KwpError::SubFunctionNotSupportedInvalidFormat)
+        } else {
+            if cmd[1] == 0x86 {
+                let mut response = [0; 17];
+                response[0] = 0x86;
+                response[6] = 07;
+                response[7] = 25;
+                response[8] = get_bootloader_info().compile_month;
+                response[9] = get_bootloader_info().compile_year;
+                response[10] = 0x08; // ECU Origin (siemens)
+                response[11] = 0x02; // EGS52
+                #[cfg(debug_assertions)]
+                {
+                    // Set development bit if this is a debug build
+                    response[11] |= 0b1000_0000;
+                }
+                response[12] = 0xFE; // Diag version low byte
+
+                let [day, month, _, year] = self.nvm.read_userpage().userpage1_as_slice()[0..4]
+                else {
+                    unreachable!()
+                };
+                response[14] = year;
+                response[15] = month;
+                response[16] = day;
+                Ok(self.make_positive_reply(cmd[0], &response))
+            } else if cmd[1] == 0x87 {
+                let mut response = [0; 21];
+                response[0] = 0x87;
+                response[1] = 0x08; // ECU Origin (Siemens)
+                response[2] = 0x00; // Supplier
+                response[3] = 0x02; // EGS52
+                #[cfg(debug_assertions)]
+                {
+                    // Set development bit if this is a debug build
+                    response[3] |= 0b1000_0000;
+                }
+                response[4] = 0xFE; // Diag version low byte
+
+                // HW Version
+                response[6] = 2;
+                response[7] = 0;
+                // SW Version
+                response[8] = get_bootloader_info().version_major;
+                response[9] = get_bootloader_info().version_minor;
+                response[10] = get_bootloader_info().version_patch;
+                response[11..21].copy_from_slice("1234567890".as_bytes());
+                Ok(self.make_positive_reply(cmd[0], &response))
+            } else {
+                Err(KwpError::SubFunctionNotSupportedInvalidFormat)
+            }
+        }
+    }
+
     fn routine_start(&mut self, cmd: &[u8]) -> ServerResult {
         if self.mode != KwpSessionType::Reprogramming {
             return Err(KwpError::ServiceNotSupportedInActiveSession);
@@ -335,6 +394,29 @@ impl KwpServer {
         if cmd.len() < 2 {
             // At least 1 arg for LID
             Err(KwpError::SubFunctionNotSupportedInvalidFormat)
+        } else if cmd[1] == 0x24 {
+            if cmd.len() != 6 {
+                return Err(KwpError::SubFunctionNotSupportedInvalidFormat);
+            }
+            // Day, Week, Month, year
+            if cmd[2] > 31 || cmd[3] > 52 || cmd[4] > 12 || cmd[5] < 24 {
+                return Err(KwpError::SubFunctionNotSupportedInvalidFormat);
+            //} else if self.nvm.read_userpage().userpage1_as_slice()[..4] != [0xFF; 4] {
+            //    return Err(KwpError::ConditionsNotCorrectRequestSequenceError);
+            } else {
+                if unsafe {
+                    self.nvm.modify_userpage(|f| {
+                        println!("{:02X}", cmd[2..]);
+                        f.userpage1_as_slice_mut()[..4].copy_from_slice(&cmd[2..]);
+                    })
+                }
+                .is_ok()
+                {
+                    Ok(self.make_positive_reply(cmd[0], &[cmd[1]]))
+                } else {
+                    Err(KwpError::GeneralReject)
+                }
+            }
         } else if cmd[1] == 0xE0 {
             if cmd.len() != 8 {
                 return Err(KwpError::SubFunctionNotSupportedInvalidFormat);

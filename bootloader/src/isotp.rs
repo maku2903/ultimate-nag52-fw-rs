@@ -36,10 +36,7 @@ impl Default for IsoTp {
     }
 }
 
-pub const ISOTP_STMIN: u8 = 10;
-pub const ISOTP_BS: u8 = 0; // UN52 can handle this, OEM EGS cannot
-
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
 pub enum IsoTpMode {
     Rx {
         rx_count: u8,
@@ -72,7 +69,7 @@ impl IsoTp {
                 0x10 => {
                     // Start Rx
                     let expected_size = ((data[0] & 0x0F) as usize) << 8 | data[1] as usize;
-                    defmt::info!("ISOTP Long Rx expects {} bytes", expected_size);
+                    defmt::debug!("ISOTP Long Rx expects {} bytes", expected_size);
                     // Safety, since it is 12 bit number, it is impossible to exceed the size of buffer!
                     // Send flow control
                     let tx_fc = Message::new(MessageBuilder {
@@ -217,7 +214,6 @@ impl IsoTp {
         data: &[u8],
         tx: &mut mcan::tx_buffers::Tx<'a, Can0, Capacities>,
     ) {
-        defmt::info!("Write called");
         if data.len() < 8 {
             let mut packet_buf: [u8; 8] = [0; 8];
             packet_buf[0] = data.len() as u8;

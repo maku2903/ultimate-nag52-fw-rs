@@ -3,33 +3,26 @@
 
 use core::{borrow::BorrowMut, panic::PanicInfo};
 
-use bsp::LedStatus;
-
 use atsamd_hal::{
-    can::Dependencies,
-    clock::v2::{
+    can::Dependencies, clock::v2::{
         clock_system_at_reset,
         dfll::FromUsb,
         dpll::Dpll,
         gclk::{Gclk, GclkDiv16},
         pclk::Pclk,
-    },
-    ehal::digital::{InputPin, OutputPin},
-    fugit::HertzU32,
-    nvm::Nvm,
-    pac::{self, Peripherals},
-    trng::Trng,
-    usb::{
+    }, ehal::digital::{InputPin, OutputPin}, fugit::HertzU32, nvm::Nvm, pac::{self, Peripherals}, prelude::_embedded_hal_Pwm, pwm::{Channel, TCC0Pinout, Tcc0Pwm}, serial_number, trng::Trng, usb::{
         usb_device::{
             bus::UsbBusAllocator,
             device::{StringDescriptors, UsbDeviceBuilder, UsbRev, UsbVidPid},
         },
         UsbBus,
-    },
+    }
 };
 
 use cortex_m::{asm::delay, interrupt::free, peripheral::NVIC};
 use cortex_m_rt::entry;
+use defmt::println;
+use heapless::format;
 use mcan::{
     embedded_can::StandardId, filter::Filter, message::Raw, messageram::SharedMemory,
     rx_fifo::DynRxFifo,
@@ -43,7 +36,7 @@ use usb_isotp::*;
 
 use defmt_rtt as _;
 use systick_timer::Timer;
-use usbd_serial::SerialPort;
+use usbd_serial::{SerialPort, USB_CLASS_CDC};
 
 use crate::{
     bl_info::{app_crc, APP_ADDR_START},
@@ -65,7 +58,7 @@ pub const CAN_ID_RX: StandardId = unsafe { StandardId::new_unchecked(0x7E1) };
 static mut SHARED_MEM_CAN0: SharedMemory<bsp::can_deps::Capacities> = SharedMemory::new();
 
 // Set up for micro-second resolution, reload every 1 milliseond, 48 MHz clock
-pub static INSTANCE: Timer = Timer::new(1000, 4799, 48_000_000);
+pub static INSTANCE: Timer = Timer::new(1000, 4799, 100_000_000);
 
 #[cortex_m_rt::exception]
 fn SysTick() {
@@ -152,7 +145,7 @@ fn main() -> ! {
         .ok();
 
     // USB Init
-    let (usb_clock, _gclk2_48) = Pclk::enable(tokens.pclks.usb, gclk2_48);
+    let (usb_clock, gclk2_48) = Pclk::enable(tokens.pclks.usb, gclk2_48);
     let usb_bus = UsbBus::new(
         &(usb_clock.into()),
         &mut mclk,
@@ -163,26 +156,21 @@ fn main() -> ! {
     let usb_alloc = USB_ALLOCATOR.init(UsbBusAllocator::new(usb_bus));
     let ctrl_buf = USB_CTRL_BUF.init([0; 256]);
 
-    let tx_buf = USB_ISOTP_TX.init([0; 4096]);
-    let rx_buf = USB_ISOTP_RX.init([0; 4096]);
+    let uart = SerialPort::new(usb_alloc);
 
-    let uart = SerialPort::new_with_store_and_interface_names(
-        usb_alloc,
-        tx_buf.borrow_mut(),
-        rx_buf.borrow_mut(),
-        Some("ULTIMATE-NAG52 COMM"),
-        Some("ULTIMATE-NAG52 DATA"),
-    );
+    let sn  = serial_number();
+    let sn_bytes = USB_SN.init(heapless::String::new());
+    for b in sn {
+        let _ = sn_bytes.push_str(&format!(2; "{b:02X}").unwrap());
+    }
 
     let usb = UsbDeviceBuilder::new(usb_alloc, UsbVidPid(0x16c0, 0x27de), ctrl_buf)
         .strings(&[StringDescriptors::default()
             .manufacturer("rnd-ash")
-            .product("Ultimate NAG52 V2")
-            .serial_number("BOOTLOADER")])
+            .product("Ultimate NAG52 V2 BOOTLOADER")
+            .serial_number(sn_bytes)])
         .expect("Failed to set strings")
-        .device_class(0x08)
-        .max_packet_size_0(64)
-        .unwrap()
+        .device_class(USB_CLASS_CDC)
         .usb_rev(UsbRev::Usb200)
         .build()
         .unwrap();
@@ -211,48 +199,77 @@ fn main() -> ! {
         });
     }
 
+    // LED status init (Pulsing)
+    let (clock_tcc0, _gclk2_48) = Pclk::enable(tokens.pclks.tcc0_tcc1, gclk2_48);
+    let pinout = TCC0Pinout::Pd8(pins.led_status);
+    let mut tcc = Tcc0Pwm::new(
+        &clock_tcc0.into(),
+        HertzU32::kHz(1),
+        bsp_peripherals.tcc0,
+        pinout,
+        &mut mclk,
+    );
+    tcc.set_duty(Channel::_1, 0);
+
     let mut can = can0_cfg.finalize().unwrap();
     let mut can_tx = can.tx;
     let mut isotp = IsoTp::default();
-    let nvm = Nvm::new(bsp_peripherals.nvmctrl);
+    let mut usb_isotp = UsbIsoTp::default();
 
+    let nvm = Nvm::new(bsp_peripherals.nvmctrl);
     let trng = Trng::new(&mut mclk, bsp_peripherals.trng);
 
     let mut server = KwpServer::new(nvm, trng);
+
     let mut diag_buffer = [0u8; 4096];
-    let mut req_len: Option<usize>;
-
-    let mut stat_led: LedStatus = pins.led_status.into();
     let mut is_usb = false;
-    let mut isotp_usb_state = UsbIsotpState::Idle;
+    let mut inc = true;
+    let mut x: u16 = 0;
+    let max_pwm = tcc.get_max_duty();
+    let mut i = 0u32;
     loop {
-        req_len = None;
-        if let Ok(packet) = can.rx_fifo_0.receive() {
-            if let Some(isotp_rx) = isotp.on_packet_rx(packet.data(), &mut can_tx) {
-                defmt::debug!("CAN ISOTP Rx: {:02X}", isotp_rx);
-                diag_buffer[..isotp_rx.len()].copy_from_slice(isotp_rx);
-                is_usb = false;
-                req_len = Some(isotp_rx.len());
+        if i % 10 == 0 {
+            tcc.set_duty(Channel::_1, x as u32);
+            if inc {
+                x += 1;
+                if x == (max_pwm / 4) as u16 {
+                    inc = false;
+                }
+            } else {
+                x -= 1;
+                if x == 0 {
+                    inc = true;
+                }
             }
-        } else if let Some(size) = read_payload(&mut diag_buffer, &mut isotp_usb_state) {
-            is_usb = true;
-            req_len = Some(size)
         }
+        i = i.wrapping_add(1);
+        let req = if let Some(rx) = can
+            .rx_fifo_0
+            .receive()
+            .ok()
+            .and_then(|packet| isotp.on_packet_rx(packet.data(), &mut can_tx))
+        {
+            is_usb = false;
+            Some(rx)
+        } else if let Some(size) = usb_isotp.read_payload(&mut diag_buffer) {
+            is_usb = true;
+            Some(&diag_buffer[..size])
+        } else {
+            None
+        };
 
-        if let Some(len) = req_len {
-            stat_led.set_high().unwrap();
-            defmt::debug!("KWP IN: {:02X}", diag_buffer[..len]);
-            let response = server.process_cmd(&diag_buffer[..len], INSTANCE.now());
-            stat_led.set_low().unwrap();
+        if let Some(req) = req {
+            defmt::debug!("KWP IN: {:02X}", req);
+            let response = server.process_cmd(req, INSTANCE.now());
             match is_usb {
-                true => write_usb(response),
+                true => usb_isotp.write_payload(response),
                 false => isotp.write_payload(response, &mut can_tx),
             }
         }
-        // Do this after Txing on CAN
+        // Do this after Txing
         if let Some(tx) = server.update(INSTANCE.now()) {
             match is_usb {
-                true => write_usb(tx),
+                true => usb_isotp.write_payload(tx),
                 false => isotp.write_payload(tx, &mut can_tx),
             }
         }

@@ -3,8 +3,8 @@ use konst::{parsing::Parser, result};
 
 const BOOTLOADER_INFO_ADDR: u32 = 0x10000 - 512; // See memory.x
 
-pub const APP_ADDR_START: u32 = 0x00010000; // 64KB
-pub const APP_ADDR_END: u32 = 0x00080000; // 512KB
+pub (crate) const APP_ADDR_START: u32 = 0x00010000; // 64KB
+pub (crate) const APP_ADDR_END: u32 = 0x00080000; // 512KB
 
 #[derive(defmt::Format, Clone, Copy, PartialEq, Eq)]
 #[repr(C, packed(4))]
@@ -33,7 +33,7 @@ const fn parse_u8(s: &str) -> u8 {
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".bl_info")]
-pub static BOOTLOADER_INFO: BootloaderInfo = BootloaderInfo {
+static BOOTLOADER_INFO: BootloaderInfo = BootloaderInfo {
     name: *b"UN52 xGS",
     version_major: parse_u8(env!("CARGO_PKG_VERSION_MAJOR")),
     version_minor: parse_u8(env!("CARGO_PKG_VERSION_MINOR")),
@@ -49,7 +49,7 @@ pub static BOOTLOADER_INFO: BootloaderInfo = BootloaderInfo {
     application_crc: 0xFFFF_FFFF,
 };
 
-pub fn app_crc() -> u32 {
+pub (crate) fn app_crc() -> u32 {
     let start = core::ptr::slice_from_raw_parts(
         APP_ADDR_START as *mut u8,
         (APP_ADDR_END - APP_ADDR_START) as usize,
@@ -64,7 +64,7 @@ pub fn get_bootloader_info() -> &'static BootloaderInfo {
     }
 }
 
-pub fn mutate_bootloader_info<F: FnOnce(&mut BootloaderInfo)>(
+pub (crate) fn mutate_bootloader_info<F: FnOnce(&mut BootloaderInfo)>(
     nvm: &mut Nvm,
     f: F,
 ) -> nvm::Result<()> {
