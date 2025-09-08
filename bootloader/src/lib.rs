@@ -1,6 +1,7 @@
 #![no_std]
 pub const MAX_RESET_COUNT: u8 = 5;
 
+pub mod bl_info;
 
 pub struct BootloaderState {
     // Bootloader -> Application

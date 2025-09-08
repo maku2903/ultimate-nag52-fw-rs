@@ -1,10 +1,12 @@
 MEMORY
 {
-  FLASH (rx)    : ORIGIN = 0x00000000, LENGTH = 64K-512
-  BL_INFO       : ORIGIN = 0x00000000 + 64K-512, LENGTH = 512
-  CAN           : ORIGIN = 0x20000000, LENGTH = 64K
-  BL_COMM (xrw) : ORIGIN = 0x20010000, LENGTH = 512
-  RAM (xrw)     : ORIGIN = 0x20010200, LENGTH = 256K - 64K - 512
+  # Preloader = 0-8KB
+  # Bootloader + info = 8-96KB
+  FLASH (rx)    : ORIGIN = 0x00000000 + 8K,        LENGTH = 112K
+  BL_INFO       : ORIGIN = 0x00000000 + 120K,      LENGTH = 8K
+  CAN           : ORIGIN = 0x20000000,             LENGTH = 64K
+  BL_COMM (xrw) : ORIGIN = 0x20000000 + 64K,       LENGTH = 512
+  RAM (xrw)     : ORIGIN = 0x20000000 + 64K + 512, LENGTH = 256K - 64K - 512
 }
 
 SECTIONS {

@@ -1,8 +1,8 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use color_eyre::eyre::Report;
 use ecu_diagnostics::channel::{ChannelError, IsoTPChannel, PayloadChannel};
-use serial_rs::{SerialPort, SerialPortSettings};
+use serialport::SerialPort;
 
 pub struct UsbDiagIface {
     serial: Box<dyn SerialPort>
@@ -14,11 +14,9 @@ unsafe impl Sync for UsbDiagIface{}
 impl UsbDiagIface {
     pub fn new(port: &str) -> Result<Self, Report> {
 
-        let settings = SerialPortSettings::default()
-            .read_timeout(Some(1000))
-            .write_timeout(Some(1000));
-
-        let serial = serial_rs::new_from_path(port, Some(settings))?;
+        let serial = serialport::new(port, 9600)
+            .timeout(Duration::from_millis(1000))
+            .open()?;
         Ok(Self {
             serial
         })

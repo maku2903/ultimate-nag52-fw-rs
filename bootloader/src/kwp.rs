@@ -1,18 +1,22 @@
-use core::{ops::Not, ptr::NonNull, sync::atomic::Ordering};
+use core::{ptr::NonNull, sync::atomic::Ordering};
 
 use atsamd_hal::{
     self,
+    fugit::ExtU64,
     nvm::{self, Nvm},
     pac::{dsu::did::Seriesselect, Peripherals},
+    rtic_time::Monotonic,
+    serial_number,
     trng::Trng,
 };
 pub use automotive_diag::kwp2000::*;
-use cortex_m::{asm::delay, peripheral::SCB};
+use bootloader::bl_info::MemoryRegion;
+use cortex_m::peripheral::SCB;
 use defmt::println;
 
 use crate::{
-    bl_info::{self, app_crc, get_bootloader_info, APP_ADDR_END, APP_ADDR_START},
-    isotp::{BS_EGS, ST_MIN_EGS},
+    bl_info::{self, get_bootloader_info, region_crc},
+    Mono, BS_EGS, ST_MIN_EGS,
 };
 
 #[derive(Copy, Clone)]
@@ -178,7 +182,7 @@ impl KwpServer {
         }
     }
 
-    pub fn update(&mut self, now_ms: u64) -> Option<&[u8]> {
+    pub async fn update(&mut self, now_ms: u64) -> Option<&[u8]> {
         if now_ms - self.last_cmd_time > P2_MAX_MS && self.mode != KwpSessionType::Normal {
             defmt::debug!("Tester timeout. Going back to default mode");
             self.mode = KwpSessionType::Normal;
@@ -187,7 +191,7 @@ impl KwpServer {
         }
         match &mut self.pending_operation {
             PendingOperation::Reset => {
-                delay(10_000);
+                Mono::delay(1u64.millis()).await;
                 SCB::sys_reset();
             }
             PendingOperation::FlashErase {
@@ -240,6 +244,7 @@ impl KwpServer {
                 Some(KwpCommand::RequestTransferExit) => self.transfer_exit(cmd),
                 Some(KwpCommand::StartRoutineByLocalIdentifier) => self.routine_start(cmd),
                 Some(KwpCommand::ReadECUIdentification) => self.ecu_ident(cmd),
+                Some(KwpCommand::ReadDataByLocalIdentifier) => self.read_data_local_ident(cmd),
                 Some(KwpCommand::RequestRoutineResultsByLocalIdentifier) => {
                     self.routine_results(cmd)
                 }
@@ -313,7 +318,6 @@ impl KwpServer {
         } else {
             let len: usize = cmd[1] as usize;
             let addr = u32::from_le_bytes(cmd[2..6].try_into().unwrap());
-
             self.check_addr(addr, true)?;
             self.check_addr(addr + len as u32 - 1, true)?;
 
@@ -323,7 +327,24 @@ impl KwpServer {
 
                 let ptr = core::ptr::NonNull::new_unchecked(addr as *mut u8);
                 ptr.copy_to_nonoverlapping(NonNull::new_unchecked(dest_ptr), len);
-                Ok(self.make_positive_reply(cmd[0], &buf))
+                Ok(self.make_positive_reply(cmd[0], &buf[..len]))
+            }
+        }
+    }
+
+    fn read_data_local_ident(&mut self, cmd: &[u8]) -> ServerResult {
+        if cmd.len() != 2 {
+            // 1 byte for ID type
+            Err(KwpError::SubFunctionNotSupportedInvalidFormat)
+        } else {
+            if cmd[1] == 0xE1 {
+                let sn = serial_number();
+                let mut res = [0; 17];
+                res[0] = 0xE1;
+                res[1..].copy_from_slice(&sn);
+                Ok(self.make_positive_reply(cmd[0], &res))
+            } else {
+                Err(KwpError::SubFunctionNotSupportedInvalidFormat)
             }
         }
     }
@@ -338,7 +359,7 @@ impl KwpServer {
                 response[0] = 0x86;
                 response[6] = 07;
                 response[7] = 25;
-                response[8] = get_bootloader_info().compile_month;
+                response[8] = get_bootloader_info().compile_week;
                 response[9] = get_bootloader_info().compile_year;
                 response[10] = 0x08; // ECU Origin (siemens)
                 response[11] = 0x02; // EGS52
@@ -347,9 +368,9 @@ impl KwpServer {
                     // Set development bit if this is a debug build
                     response[11] |= 0b1000_0000;
                 }
-                response[12] = 0xFE; // Diag version low byte
+                response[12] = 0xE1; // Diag version low byte
 
-                let [day, month, _, year] = self.nvm.read_userpage().userpage1_as_slice()[0..4]
+                let [day, _, month, year] = self.nvm.read_userpage().userpage1_as_slice()[0..4]
                 else {
                     unreachable!()
                 };
@@ -368,7 +389,7 @@ impl KwpServer {
                     // Set development bit if this is a debug build
                     response[3] |= 0b1000_0000;
                 }
-                response[4] = 0xFE; // Diag version low byte
+                response[4] = 0xE1; // Diag version low byte
 
                 // HW Version
                 response[6] = 2;
@@ -395,14 +416,17 @@ impl KwpServer {
             // At least 1 arg for LID
             Err(KwpError::SubFunctionNotSupportedInvalidFormat)
         } else if cmd[1] == 0x24 {
+            if self.sec_level != SecurityLevel::FullUnlocked {
+                return Err(KwpError::SecurityAccessDenied);
+            }
             if cmd.len() != 6 {
                 return Err(KwpError::SubFunctionNotSupportedInvalidFormat);
             }
             // Day, Week, Month, year
             if cmd[2] > 31 || cmd[3] > 52 || cmd[4] > 12 || cmd[5] < 24 {
                 return Err(KwpError::SubFunctionNotSupportedInvalidFormat);
-            //} else if self.nvm.read_userpage().userpage1_as_slice()[..4] != [0xFF; 4] {
-            //    return Err(KwpError::ConditionsNotCorrectRequestSequenceError);
+            } else if self.nvm.read_userpage().userpage1_as_slice()[..4] != [0xFF; 4] {
+                return Err(KwpError::ConditionsNotCorrectRequestSequenceError);
             } else {
                 if unsafe {
                     self.nvm.modify_userpage(|f| {
@@ -421,16 +445,24 @@ impl KwpServer {
             if cmd.len() != 8 {
                 return Err(KwpError::SubFunctionNotSupportedInvalidFormat);
             }
-            let start_addr = u32::from_le_bytes(cmd[2..6].try_into().unwrap());
+            let mut start_addr = u32::from_le_bytes(cmd[2..6].try_into().unwrap());
             let num_blocks = u16::from_le_bytes(cmd[6..8].try_into().unwrap());
 
-            // Mark app as erased now
-            if let Err(e) = bl_info::mutate_bootloader_info(&mut self.nvm, |info| {
-                info.flashing_not_done = 0xFF;
-                info.application_crc = 0xFFFF_FFFF
-            }) {
-                defmt::error!("Bootloader info mutate error: {}", e);
-                return Err(KwpError::GeneralReject);
+            if start_addr == MemoryRegion::Bootloader.range_exclusive().start {
+                start_addr = MemoryRegion::Application.range_exclusive().start;
+            } else if start_addr >= MemoryRegion::Application.range_exclusive().start {
+                // Mark app as erased now
+                if let Err(e) = unsafe {
+                    bl_info::mutate_bootloader_info(&mut self.nvm, |info| {
+                        info.app_flashing_not_done = 0xFF;
+                        info.application_crc = 0xFFFF_FFFF
+                    })
+                } {
+                    defmt::error!("Bootloader info mutate error: {}", e);
+                    return Err(KwpError::GeneralReject);
+                }
+            } else {
+                return Err(KwpError::RequestOutOfRange);
             }
 
             // Do routine
@@ -446,8 +478,17 @@ impl KwpServer {
                 return Err(KwpError::SubFunctionNotSupportedInvalidFormat);
             }
             let targ_crc = u32::from_le_bytes(cmd[2..6].try_into().unwrap());
-            let start_addr = u32::from_le_bytes(cmd[6..10].try_into().unwrap());
-            let end_addr = u32::from_le_bytes(cmd[10..14].try_into().unwrap());
+            let mut start_addr = u32::from_le_bytes(cmd[6..10].try_into().unwrap());
+            let mut end_addr = u32::from_le_bytes(cmd[10..14].try_into().unwrap());
+            let mut is_bootloader = false;
+
+            if start_addr == MemoryRegion::Bootloader.start_addr() {
+                start_addr = MemoryRegion::BootloaderScratch.start_addr();
+                end_addr += MemoryRegion::BootloaderScratch.start_addr()
+                    - MemoryRegion::Bootloader.start_addr();
+                is_bootloader = true;
+            }
+
             // Just check that addrs are valid
             self.check_addr(start_addr, false)?;
             self.check_addr(end_addr, false)?;
@@ -464,10 +505,22 @@ impl KwpServer {
                 let result = embedded_crc32c::crc32c(slice);
                 if result == targ_crc {
                     // CRC32 OK, now make a CRC of the entire app flash region, and write it to the app
-                    if let Err(e) = bl_info::mutate_bootloader_info(&mut self.nvm, |info| {
-                        info.flashing_not_done = 0;
-                        info.application_crc = app_crc()
-                    }) {
+                    if let Err(e) = unsafe {
+                        if is_bootloader {
+                            bl_info::mutate_bootloader_info(&mut self.nvm, |info| {
+                                info.bootloader_flashing_pending = 0;
+                                info.bootloader_flashing_crc = region_crc(
+                                    bl_info::MemoryRegion::BootloaderScratch.range_exclusive(),
+                                )
+                            })
+                        } else {
+                            bl_info::mutate_bootloader_info(&mut self.nvm, |info| {
+                                info.app_flashing_not_done = 0;
+                                info.application_crc =
+                                    region_crc(bl_info::MemoryRegion::Application.range_exclusive())
+                            })
+                        }
+                    } {
                         defmt::error!("Bootloader info mutate error: {}", e);
                         return Err(KwpError::GeneralReject);
                     }
@@ -526,21 +579,27 @@ impl KwpServer {
             // 0..2 -> Address
             // 3 -> Format (00 is only supported)
             // 4..8 -> Size
-            let addr = u32::from_le_bytes(cmd[1..5].try_into().unwrap());
+            let mut addr = u32::from_le_bytes(cmd[1..5].try_into().unwrap());
             let fmt = cmd[5];
             let size = u32::from_le_bytes(cmd[6..10].try_into().unwrap());
-            if fmt != 0 || addr < APP_ADDR_START || addr + size > APP_ADDR_END {
-                Err(KwpError::SubFunctionNotSupportedInvalidFormat)
-            } else {
-                // Valid params, lets start flashing
-                const BLOCK_SIZE: u16 = 1024;
-                let bs = [(BLOCK_SIZE >> 8) as u8, (BLOCK_SIZE & 0xFF) as u8];
-                self.pending_operation = PendingOperation::Flashing {
-                    blk_id: 0,
-                    current_addr: addr,
-                };
-                Ok(self.make_positive_reply(cmd[0], &bs))
+            let app_region = MemoryRegion::Application.range_exclusive();
+
+            if addr == MemoryRegion::Bootloader.start_addr() {
+                addr = MemoryRegion::BootloaderScratch.start_addr();
+            } else if fmt != 0
+                || !app_region.contains(&addr)
+                || !app_region.contains(&(addr + size))
+            {
+                return Err(KwpError::SubFunctionNotSupportedInvalidFormat);
             }
+            // Valid params, lets start flashing
+            const BLOCK_SIZE: u16 = 1024;
+            let bs = [(BLOCK_SIZE >> 8) as u8, (BLOCK_SIZE & 0xFF) as u8];
+            self.pending_operation = PendingOperation::Flashing {
+                blk_id: 0,
+                current_addr: addr,
+            };
+            Ok(self.make_positive_reply(cmd[0], &bs))
         }
     }
 

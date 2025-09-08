@@ -1,253 +1,250 @@
-//! Blocking ISOTP module for sending and receiving data
-
-use core::{
-    cmp::min,
-    sync::atomic::{AtomicU8, Ordering},
-};
-
-use atsamd_hal::clock::v2::types::Can0;
+use atsamd_hal::{clock::v2::pclk, fugit::ExtU64, rtic_time::Monotonic};
 use bsp::can_deps::Capacities;
 use mcan::{
-    embedded_can::Id,
+    embedded_can::{Id, StandardId},
     message::tx::{AnyMessage, ClassicFrameType, FrameType, Message, MessageBuilder},
     tx_buffers::DynTx,
 };
+use rtic_sync::{
+    arbiter::Arbiter,
+    signal::{Signal, SignalReader, SignalWriter},
+};
 
-use crate::{CAN_ID_TX, INSTANCE};
+use crate::Mono;
 
-pub static ST_MIN_EGS: AtomicU8 = AtomicU8::new(10);
-pub static BS_EGS: AtomicU8 = AtomicU8::new(0x20);
-
-pub struct IsoTp {
-    buffer: [u8; 4096],
-    buffer_len: usize,
-    buffer_pos: usize,
-    mode: IsoTpMode,
+#[inline(always)]
+fn make_fc_ok(stmin: u8, bs: u8) -> [u8; 8] {
+    [0x30, bs, stmin, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC]
 }
 
-impl Default for IsoTp {
-    fn default() -> Self {
-        Self {
-            buffer: [0; 4096],
-            buffer_len: 0,
-            buffer_pos: 0,
-            mode: IsoTpMode::Idle,
-        }
-    }
+#[inline(always)]
+fn make_fc_reject() -> [u8; 8] {
+    [0x32, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC]
 }
 
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
-pub enum IsoTpMode {
-    Rx {
-        rx_count: u8,
-    },
-    Tx {
-        pci: u8,
-    },
-    #[default]
-    Idle,
+fn write(
+    id: StandardId,
+    data: [u8; 8],
+    tx: &mut mcan::tx_buffers::Tx<'static, pclk::ids::Can0, Capacities>,
+) -> Result<(), ()> {
+    let msg = Message::new(MessageBuilder {
+        id: Id::Standard(id),
+        frame_type: FrameType::Classic(ClassicFrameType::Data(&data)),
+        store_tx_event: None,
+    })
+    .unwrap();
+    tx.transmit_queued(msg).map_err(|_| ())
 }
 
-impl IsoTp {
-    pub fn on_packet_rx<'a>(
-        &mut self,
-        data: &[u8],
-        tx: &mut mcan::tx_buffers::Tx<'a, Can0, Capacities>,
-    ) -> Option<&[u8]> {
+pub fn make_isotp_endpoint<'a>(
+    tx_id: StandardId,
+    rx_id: StandardId,
+    can_tx: &'static Arbiter<mcan::tx_buffers::Tx<'static, pclk::ids::Can0, Capacities>>,
+    ready_signal: &'static Signal<IsotpCtsMsg>,
+    rx_signal: &'static Signal<(usize, [u8; 4096])>,
+) -> (IsoTpInterruptHandler, IsotpConsumer) {
+    let (tx_tx_signal, rx_tx_signal) = ready_signal.split();
+    let (tx_rx_ready, rx_rx_ready) = rx_signal.split();
+    (
+        IsoTpInterruptHandler {
+            rx_id,
+            tx_id,
+            rx_ready: tx_rx_ready,
+            rx_state: IsoTpMode::Idle,
+            can_tx: can_tx,
+            tx_clear_to_send: tx_tx_signal,
+        },
+        IsotpConsumer {
+            tx_id,
+            rx_ready: rx_rx_ready,
+            can_tx,
+            rx_clear_to_send: rx_tx_signal,
+        },
+    )
+}
+
+pub struct IsoTpInterruptHandler {
+    pub rx_id: StandardId,
+    tx_id: StandardId,
+    rx_ready: SignalWriter<'static, (usize, [u8; 4096])>,
+    rx_state: IsoTpMode,
+    can_tx: &'static Arbiter<mcan::tx_buffers::Tx<'static, pclk::ids::Can0, Capacities>>,
+    tx_clear_to_send: SignalWriter<'static, IsotpCtsMsg>,
+}
+
+impl IsoTpInterruptHandler {
+    pub fn on_frame_rx(&mut self, data: &[u8], ecu_stmin: u8, ecu_bs: u8) {
         if data.len() == 8 {
-            match data[0] & 0xF0 {
-                0x00 => {
-                    // Single frame Rx
-                    let len = data[0] & 0x0F;
-                    if len < 8 {
-                        self.buffer[..len as usize].copy_from_slice(&data[1..1 + len as usize]);
-                        Some(&self.buffer[..len as usize])
-                    } else {
-                        None
-                    }
+            let pci = data[0] & 0xF0;
+            match pci {
+                0x00 if data[0] < 8 => {
+                    let size = data[0] as usize;
+                    let buf = &data[1..1 + size];
+                    let mut tmp = [0; 4096];
+                    tmp[..size].copy_from_slice(buf);
+                    self.rx_ready.write((size, tmp));
                 }
                 0x10 => {
-                    // Start Rx
-                    let expected_size = ((data[0] & 0x0F) as usize) << 8 | data[1] as usize;
-                    defmt::debug!("ISOTP Long Rx expects {} bytes", expected_size);
-                    // Safety, since it is 12 bit number, it is impossible to exceed the size of buffer!
-                    // Send flow control
-                    let tx_fc = Message::new(MessageBuilder {
-                        id: Id::Standard(CAN_ID_TX),
-                        frame_type: FrameType::Classic(ClassicFrameType::Data(&[
-                            0x30,
-                            BS_EGS.load(Ordering::Relaxed),
-                            ST_MIN_EGS.load(Ordering::Relaxed),
-                            0,
-                            0,
-                            0,
-                            0,
-                            0,
-                        ])),
-                        store_tx_event: None,
-                    })
-                    .unwrap();
-                    if tx.transmit_queued(tx_fc).is_ok() {
-                        self.buffer_pos = 6;
-                        self.buffer_len = expected_size;
-                        self.mode = IsoTpMode::Rx { rx_count: 0 };
-                        self.buffer[..6].copy_from_slice(&data[2..]);
+                    if let Some(mut can_tx) = self.can_tx.try_access() {
+                        // Accept
+                        let size = (((data[0] & 0x0F) as u16) << 8 | (data[1] as u16)) as usize;
+                        let mut buf = [0; 4096];
+                        buf[..6].copy_from_slice(&data[2..]);
+                        if write(self.tx_id, make_fc_ok(ecu_stmin, ecu_bs), &mut can_tx).is_ok() {
+                            self.rx_state = IsoTpMode::Rx {
+                                stmin: ecu_stmin,
+                                bs: ecu_bs,
+                                buf: buf,
+                                rx_count: 0,
+                                buf_pos: 6,
+                                targ_size: size,
+                            };
+                        }
                     }
-                    None
                 }
                 0x20 => {
-                    if let IsoTpMode::Rx { rx_count } = &mut self.mode {
-                        // Only do this in Rx mode
-                        let max_copy = min(7, self.buffer_len - self.buffer_pos);
-                        self.buffer[self.buffer_pos..self.buffer_pos + max_copy]
-                            .copy_from_slice(&data[1..1 + max_copy]);
-                        self.buffer_pos += max_copy;
-                        *rx_count = rx_count.wrapping_add(1);
-                        if self.buffer_pos == self.buffer_len {
-                            Some(&self.buffer[..self.buffer_pos])
-                        } else {
-                            let bs = BS_EGS.load(Ordering::Relaxed);
-                            if bs != 0 && *rx_count == bs {
-                                *rx_count = 0;
-                                let tx_fc = Message::new(MessageBuilder {
-                                    id: Id::Standard(CAN_ID_TX),
-                                    frame_type: FrameType::Classic(ClassicFrameType::Data(&[
-                                        0x30,
-                                        bs,
-                                        ST_MIN_EGS.load(Ordering::Relaxed),
-                                        0,
-                                        0,
-                                        0,
-                                        0,
-                                        0,
-                                    ])),
-                                    store_tx_event: None,
+                    if let IsoTpMode::Rx {
+                        stmin,
+                        bs,
+                        buf,
+                        rx_count,
+                        buf_pos,
+                        targ_size,
+                    } = &mut self.rx_state
+                    {
+                        *rx_count += 1;
+                        let max = core::cmp::min(7, *targ_size - *buf_pos);
+                        buf[*buf_pos..*buf_pos + max].copy_from_slice(&data[1..1 + max]);
+                        *buf_pos += max;
+                        if buf_pos == targ_size {
+                            // Done
+                            self.rx_ready.write((*buf_pos, *buf));
+                            self.rx_state = IsoTpMode::Idle;
+                        } else if *bs != 0 && rx_count == bs {
+                            if self
+                                .can_tx
+                                .try_access()
+                                .and_then(|mut tx| {
+                                    write(self.tx_id, make_fc_ok(*stmin, *bs), &mut tx).ok()
                                 })
-                                .unwrap();
-                                let _ = tx.transmit_queued(tx_fc);
+                                .is_none()
+                            {
+                                // Error
+                                self.rx_state = IsoTpMode::Idle;
+                            } else {
+                                // Ok
+                                *rx_count = 0;
                             }
-
-                            None
                         }
-                    } else {
-                        None
                     }
                 }
                 0x30 => {
-                    if let IsoTpMode::Tx { pci } = &mut self.mode {
-                        if data[0] == 0x30 {
-                            let bs = data[1];
-                            let mut bs_count = bs;
-                            let st_min = data[2];
-                            let mut tx_complete = false;
-                            let mut packet = [0u8; 8];
-                            while bs == 0 || bs_count > 0 {
-                                let max_tx = min(7, self.buffer_len - self.buffer_pos);
-                                packet[0] = *pci;
-                                packet[1..1 + max_tx].copy_from_slice(
-                                    &self.buffer[self.buffer_pos..self.buffer_pos + max_tx],
-                                );
+                    if data[0] == 0x30 {
+                        self.tx_clear_to_send.write(IsotpCtsMsg::Ok {
+                            stmin: data[2],
+                            bs: data[1],
+                        });
+                    } else {
+                        // Reject
+                        self.tx_clear_to_send.write(IsotpCtsMsg::Reject);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
 
-                                let sf = Message::new(MessageBuilder {
-                                    id: Id::Standard(CAN_ID_TX),
-                                    frame_type: FrameType::Classic(ClassicFrameType::Data(&packet)),
-                                    store_tx_event: None,
-                                })
-                                .unwrap();
-                                if tx.transmit_queued(sf).is_ok() {
-                                    self.buffer_pos += max_tx;
-                                    if self.buffer_pos >= self.buffer_len {
-                                        tx_complete = true;
-                                        break;
+#[derive(Clone, Copy)]
+pub enum IsoTpMode {
+    Rx {
+        stmin: u8,
+        bs: u8,
+        buf: [u8; 4096],
+        rx_count: u8,
+        buf_pos: usize,
+        targ_size: usize,
+    },
+    Idle,
+}
+
+#[derive(Clone, Copy)]
+pub enum IsotpCtsMsg {
+    Ok { stmin: u8, bs: u8 },
+    Reject,
+}
+
+pub struct IsotpConsumer {
+    tx_id: StandardId,
+    rx_ready: SignalReader<'static, (usize, [u8; 4096])>,
+    can_tx: &'static Arbiter<mcan::tx_buffers::Tx<'static, pclk::ids::Can0, Capacities>>,
+    rx_clear_to_send: SignalReader<'static, IsotpCtsMsg>,
+}
+
+impl IsotpConsumer {
+    pub async fn write_payload(&mut self, buf: &[u8]) -> Result<(), ()> {
+        if buf.len() < 8 {
+            let mut tx_buf = [0; 8];
+            tx_buf[0] = buf.len() as u8;
+            tx_buf[1..1 + buf.len()].copy_from_slice(&buf);
+            write(self.tx_id, tx_buf, &mut *self.can_tx.access().await)
+        } else {
+            // We can send
+            let mut tx_buf = [0; 8];
+            tx_buf[0] = 0x10u8 | ((buf.len() >> 8) & 0x0F) as u8;
+            tx_buf[1] = (buf.len() & 0xFF) as u8;
+            tx_buf[2..].copy_from_slice(&buf[..6]);
+            write(self.tx_id, tx_buf, &mut *self.can_tx.access().await)?;
+            // Wait for clear to send a block
+            let mut pci = 0x21;
+            let mut buf_pos = 6;
+            'outer: loop {
+                match Mono::timeout_after(1000u64.millis(), self.rx_clear_to_send.wait()).await {
+                    Err(_) => {
+                        break Err(());
+                    }
+                    Ok(fc_result) => {
+                        match fc_result {
+                            IsotpCtsMsg::Ok { stmin, bs } => {
+                                let mut bs_count = bs;
+                                while bs == 0 || bs_count != 0 {
+                                    // Send frame
+                                    tx_buf[0] = pci;
+                                    let max_copy = core::cmp::min(7, buf.len() - buf_pos);
+                                    tx_buf[1..1 + max_copy]
+                                        .copy_from_slice(&buf[buf_pos..buf_pos + max_copy]);
+                                    write(self.tx_id, tx_buf, &mut *self.can_tx.access().await)?;
+                                    buf_pos += max_copy;
+                                    if buf_pos == buf.len() {
+                                        // Tx complete
+                                        break 'outer Ok(());
                                     }
-                                    if st_min != 0 {
-                                        // Wait
-                                        let start = INSTANCE.now();
-                                        while INSTANCE.now() - start < st_min as u64 {
-                                            core::hint::spin_loop();
-                                        }
+
+                                    if stmin == 0 {
+                                        Mono::delay(100u64.micros()).await;
                                     } else {
-                                        // Needed to let Tx msg clear buffer
-                                        for _ in 0..1000 {
-                                            core::hint::spin_loop();
-                                        }
+                                        Mono::delay((stmin as u64).micros()).await;
                                     }
-
-                                    // Handle PCI Increment
-                                    *pci += 1;
-                                    if *pci == 0x30 {
-                                        *pci = 0x20;
-                                    }
-
-                                    if bs != 0 {
-                                        bs_count -= 1;
-                                    }
-                                } else {
-                                    defmt::error!("CAN TX failed");
-                                    tx_complete = true;
-                                    break;
+                                    pci = 0x20 | (pci + 1) & 0x0F;
+                                    bs_count = bs_count.wrapping_sub(1);
                                 }
                             }
-                            if tx_complete {
-                                self.mode = IsoTpMode::Idle;
+                            IsotpCtsMsg::Reject => {
+                                write(
+                                    self.tx_id,
+                                    make_fc_reject(),
+                                    &mut *self.can_tx.access().await,
+                                )?;
+                                break 'outer Err(());
                             }
-                        } else {
-                            // Other 0x30s (0x31 and 32 are reject/aborts)
-                            self.mode = IsoTpMode::Idle;
                         }
                     }
-                    None
-                }
-                _ => {
-                    // Unknown PCI
-                    None
                 }
             }
-        } else {
-            None
         }
     }
 
-    /// Blocks until write completes
-    pub fn write_payload<'a>(
-        &mut self,
-        data: &[u8],
-        tx: &mut mcan::tx_buffers::Tx<'a, Can0, Capacities>,
-    ) {
-        if data.len() < 8 {
-            let mut packet_buf: [u8; 8] = [0; 8];
-            packet_buf[0] = data.len() as u8;
-            packet_buf[1..1 + data.len()].copy_from_slice(data);
-            let sf = Message::new(MessageBuilder {
-                id: Id::Standard(CAN_ID_TX),
-                frame_type: FrameType::Classic(ClassicFrameType::Data(&packet_buf)),
-                store_tx_event: None,
-            })
-            .unwrap();
-            if tx.transmit_queued(sf).is_err() {
-                defmt::error!("Short packet Tx failed")
-            }
-        } else {
-            // Larger than 8 bytes
-            // Write the start frame
-            let mut packet = [0u8; 8];
-            packet[0] = 0x10 | (((data.len() >> 8) & 0x0F) as u8);
-            packet[1] = (data.len() & 0xFF) as u8;
-            packet[2..8].copy_from_slice(&data[..6]);
-            let sf = Message::new(MessageBuilder {
-                id: Id::Standard(CAN_ID_TX),
-                frame_type: FrameType::Classic(ClassicFrameType::Data(&packet)),
-                store_tx_event: None,
-            })
-            .unwrap();
-            if tx.transmit_queued(sf).is_ok() {
-                // Setup for sending
-                let max = min(4095, data.len());
-                self.buffer[..max].copy_from_slice(&data[..max]);
-                self.buffer_len = max;
-                self.buffer_pos = 6;
-                self.mode = IsoTpMode::Tx { pci: 0x21 };
-            }
-        }
+    pub async fn read_payload(&mut self) -> (usize, [u8; 4096]) {
+        self.rx_ready.wait().await
     }
 }

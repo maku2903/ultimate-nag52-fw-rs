@@ -1,6 +1,6 @@
 [package]
 name = "bootloader"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [lib]
@@ -9,29 +9,38 @@ path = "src/lib.rs"
 
 [dependencies]
 bsp = { path = "../bsp" }
-atsamd-hal = { workspace = true, features = ["same54p-rt", "can", "usb"] }
+atsamd-hal = { workspace = true, features = [
+    "same54p-rt",
+    "can",
+    "usb",
+    "async",
+    "rtic",
+] }
 cortex-m-rt.workspace = true
 cortex-m.workspace = true
 mcan.workspace = true
 konst = "0.4.1"
 defmt = "1.0.1"
 defmt-rtt = "1.0.0"
-compile-time = "0.2.0"
-systick-timer = { version = "0.1.1", features = ["cortex-m"] }
+rtic = { version = "2.2.0", features = ["thumbv7-backend"] }
 automotive_diag = { version = "0.1.21", default-features = false, features = [
     "kwp2000",
 ] }
 usbd-serial = "0.2.2"
 embedded-crc32c = "0.1.0"
-static_cell = "2.1.1"
 heapless = "0.9.1"
+static_assertions = "1.1.0"
+rtic-sync = "1.4.0"
+futures = { version = "0.3.31", default-features = false }
+embedded-hal = {version="1.0.0"}
 
 [build-dependencies]
 chrono = { version = "0.4", default-features = false, features = ["now"] }
 rustc_version = "0.4.1"
 
 [features]
-skip_flash_sig_check = []
+lib = []
+skip-app-check = []
 stay-in-bootloader = []
 
 # For cargo flash

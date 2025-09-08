@@ -1,5 +1,12 @@
 [workspace]
-members = ["firmware", "bsp", "bootloader", "diag_common", "flasher"]
+members = [
+    "firmware",
+    "bsp",
+    "bootloader",
+    "diag_common",
+    "flasher",
+    "preloader",
+]
 
 [workspace.dependencies]
 atsamd-hal = { version = "0.22.2", features = [

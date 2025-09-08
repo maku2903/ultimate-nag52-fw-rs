@@ -11,11 +11,13 @@ rustflags = [
    "link-arg=-Tlink.x",
    "-C",
    "link-arg=-Tdefmt.x",
+   "-C",
+   "panic=abort",
 ]
 
 [profile.release]
 panic = "abort"
-opt-level = "s"
+opt-level = 2
 debug = 2
-lto = "fat"
+lto = "thin"
 codegen-units = 1
