@@ -9,6 +9,7 @@ path = "src/lib.rs"
 
 [dependencies]
 bsp = { path = "../bsp" }
+diag_common = {path="../diag_common", features=["mcu"]}
 atsamd-hal = { workspace = true, features = [
     "same54p-rt",
     "can",

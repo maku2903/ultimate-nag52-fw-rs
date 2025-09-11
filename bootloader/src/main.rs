@@ -46,12 +46,7 @@ use mcan::{
     message::Raw,
     tx_buffers::{DynTx, TxBufferSet},
 };
-use rtic_sync::{
-    arbiter::Arbiter,
-    signal::{Signal, SignalReader},
-};
-
-use crate::isotp::{make_isotp_endpoint, IsoTpInterruptHandler, IsotpConsumer, IsotpCtsMsg};
+use rtic_sync::{arbiter::Arbiter, signal::Signal};
 
 use core::{panic::PanicInfo, sync::atomic::AtomicU8};
 use defmt::info;
@@ -64,10 +59,8 @@ use usbd_serial::{SerialPort, USB_CLASS_CDC};
 use crate::kwp::KwpServer;
 
 mod bl_info;
-pub mod isotp;
 pub mod kwp;
-mod usb_isotp;
-use usb_isotp::*;
+pub mod usb;
 
 pub static ST_MIN_EGS: AtomicU8 = AtomicU8::new(10);
 pub static BS_EGS: AtomicU8 = AtomicU8::new(0x20);
@@ -95,17 +88,36 @@ fn can_app_start(bl_info: &BootloaderInfo) -> bool {
     return true;
 }
 
+const ISOTP_BUF_SIZE: usize = 4096;
+
 atsamd_hal::rtc_monotonic!(Mono, rtc_clock::Clock32k);
 
 #[rtic::app(device = atsamd_hal::pac, dispatchers = [DAC_EMPTY_0])]
 mod app {
+    use atsamd_hal::clock::v2::types::Can0;
+    use diag_common::isotp_endpoints::{
+        can_isotp::{make_isotp_endpoint, IsoTpInterruptHandler, IsotpConsumer, IsotpCtsMsg},
+        usb_isotp::{new_usb_isotp, UsbIsoTpConsumer},
+        SharedIsoTpBuf,
+    };
+    use usbd_serial::DefaultBufferStore;
+
+    use crate::usb::UsbData;
+
     use super::*;
 
     #[local]
     struct Resources {
-        isotp_isr: IsoTpInterruptHandler,
-        isotp_thread: IsotpConsumer,
-        isotp_usb_rx: SignalReader<'static, (usize, [u8; 4096])>,
+        isotp_isr: IsoTpInterruptHandler<'static, Can0, Capacities, ISOTP_BUF_SIZE>,
+        isotp_thread: IsotpConsumer<'static, Can0, Capacities, ISOTP_BUF_SIZE>,
+        usb_isotp_thread: UsbIsoTpConsumer<
+            'static,
+            UsbBus,
+            DefaultBufferStore,
+            DefaultBufferStore,
+            ISOTP_BUF_SIZE,
+        >,
+
         diag_server: KwpServer,
         tcc_led: Tcc0Pwm<PD08, Alternate<F>>,
         can0_interrupts: OwnedInterruptSet<pclk::ids::Can0, EnabledLine0>,
@@ -123,10 +135,11 @@ mod app {
         usb_ctrl_buf: [u8; 256] = [0; 256],
         usb_alloc: Option<UsbBusAllocator<UsbBus>> = None,
         usb_sn: heapless::String<32> = heapless::String::new(),
-        rx_ready: Signal<IsotpCtsMsg> = Signal::new(),
-        tx_ready: Signal<(usize, [u8; 4096])> = Signal::new(),
-        tx_ready_usb: Signal<(usize, [u8; 4096])> = Signal::new(),
+        isotp_can_fc_signal: Signal<IsotpCtsMsg> = Signal::new(),
+        isotp_msg_signal_can: Signal<SharedIsoTpBuf<ISOTP_BUF_SIZE>> = Signal::new(),
+        isotp_msg_signal_usb: Signal<SharedIsoTpBuf<ISOTP_BUF_SIZE>> = Signal::new(),
         arbiter_cantx: Option<Arbiter<mcan::tx_buffers::Tx<'static, pclk::ids::Can0, Capacities>>> = None
+        arbiter_serial: Option<Arbiter<SerialPort<'static, UsbBus, DefaultBufferStore, DefaultBufferStore>>> = None
     ])]
     fn init(cx: init::Context) -> (Shared, Resources) {
         // Check for good app and try to bootload
@@ -189,10 +202,11 @@ mod app {
         // Enable the 32Khz clock  and start the RTIC Monotonic driver
         let (osculp32k, _) = OscUlp32k::enable(tokens.osculp32k.osculp32k, clocks.osculp32k_base);
         let _ = RtcOsc::enable(tokens.rtcosc, osculp32k);
+        // Start OS time queue
         Mono::start(device.rtc);
 
+        // -- CAN init --
         let (clk_can, gclk2_48) = Pclk::enable(tokens.pclks.can0, gclk2_48);
-
         let (can0_deps, gclk2_48) = Dependencies::new(
             gclk2_48,
             clk_can,
@@ -220,8 +234,18 @@ mod app {
             .split([Interrupt::RxFifo0NewMessage].iter().copied().collect())
             .unwrap();
         let line0_interrupts = can0_cfg.interrupt_configuration().enable_line_0(interrupts);
+        let mut can = can0_cfg.finalize().unwrap();
+        let _ = can.tx.cancel_multi(TxBufferSet::all());
+        let arbiter_cantx: &'static _ = cx.local.arbiter_cantx.insert(Arbiter::new(can.tx));
+        let (isotp_isr, isotp_thread) = make_isotp_endpoint(
+            Id::Standard(CAN_ID_TX),
+            Id::Standard(CAN_ID_RX),
+            arbiter_cantx,
+            cx.local.isotp_can_fc_signal,
+            cx.local.isotp_msg_signal_can,
+        );
 
-        // USB Init
+        // -- USB Init --
         let (usb_clock, gclk2_48) = Pclk::enable(tokens.pclks.usb, gclk2_48);
         let usb_bus = UsbBus::new(
             &(usb_clock.into()),
@@ -230,17 +254,21 @@ mod app {
             pins.usb_dp,
             device.usb,
         );
+        // Bus allocator
         let usb_alloc: &'static _ = cx.local.usb_alloc.insert(UsbBusAllocator::new(usb_bus));
-
-        let uart = SerialPort::new(&usb_alloc);
-
+        // SerialPort CDC
+        let uart: &'static _ = cx
+            .local
+            .arbiter_serial
+            .insert(Arbiter::new(SerialPort::new(usb_alloc)));
+        // Write down the device serial number in ASCII form
         let sn = serial_number();
         for b in sn {
             let _ = cx.local.usb_sn.push_str(&format!(2; "{b:02X}").unwrap());
         }
-
+        // Build up the USB device
         let usb =
-            UsbDeviceBuilder::new(&usb_alloc, UsbVidPid(0x16c0, 0x27de), cx.local.usb_ctrl_buf)
+            UsbDeviceBuilder::new(usb_alloc, UsbVidPid(0x16c0, 0x27de), cx.local.usb_ctrl_buf)
                 .strings(&[StringDescriptors::default()
                     .manufacturer("rnd-ash")
                     .product("Ultimate NAG52 V2 BOOTLOADER")
@@ -250,16 +278,12 @@ mod app {
                 .usb_rev(UsbRev::Usb200)
                 .build()
                 .unwrap();
-
-        let (tx_usb, rx_usb) = cx.local.tx_ready_usb.split();
-
+        // Configure the USB ISOTP endpoint (Over serial)
+        let (isotp_usb_tx, isotp_usb_thread) = new_usb_isotp(uart, cx.local.isotp_msg_signal_usb);
         let usb_data = UsbData {
             led: pins.led_usb.into(),
             dev: usb,
-            usb_serial: uart,
-            reading: None,
-            tmp: [0; 4096],
-            sender: tx_usb,
+            isotp: isotp_usb_tx,
         };
 
         // LED status init (Pulsing)
@@ -272,31 +296,20 @@ mod app {
             pinout,
             &mut mclk,
         );
-        let mut can = can0_cfg.finalize().unwrap();
-        let _ = can.tx.cancel_multi(TxBufferSet::all());
 
-        let arbiter_cantx: &'static _ = cx.local.arbiter_cantx.insert(Arbiter::new(can.tx));
-
-        let (isotp_isr, isotp_thread) = make_isotp_endpoint(
-            CAN_ID_TX,
-            CAN_ID_RX,
-            arbiter_cantx,
-            cx.local.rx_ready,
-            cx.local.tx_ready,
-        );
-
+        // Diagnostic init
         let nvm = Nvm::new(device.nvmctrl);
-
         let trng = Trng::new(&mut mclk, device.trng);
-
         let server = KwpServer::new(nvm, trng);
+
+        // Task init
         diag_task::spawn().unwrap();
         led_task::spawn().unwrap();
         (
             Shared { usb: usb_data },
             Resources {
                 tcc_led,
-                isotp_usb_rx: rx_usb,
+                usb_isotp_thread: isotp_usb_thread,
                 isotp_thread,
                 isotp_isr,
                 diag_server: server,
@@ -306,10 +319,10 @@ mod app {
         )
     }
 
-    #[task(priority = 2, shared=[usb], local = [isotp_usb_rx, isotp_thread, diag_server])]
-    async fn diag_task(mut cx: diag_task::Context) {
+    #[task(priority = 2, local = [usb_isotp_thread, isotp_thread, diag_server])]
+    async fn diag_task(cx: diag_task::Context) {
         let diag_task::LocalResources {
-            isotp_usb_rx,
+            usb_isotp_thread,
             isotp_thread,
             diag_server,
             ..
@@ -317,23 +330,21 @@ mod app {
         let mut is_usb: bool = false;
         loop {
             futures::select_biased! {
-                (size, buf) = isotp_thread.read_payload().fuse() => {
+                buf = isotp_thread.read_payload().fuse() => {
                     is_usb = false;
                     let response = diag_server.process_cmd(
-                        &buf[..size],
+                        buf.payload(),
                         Mono::now().duration_since_epoch().to_millis(),
                     );
-                    let _ = isotp_thread.write_payload(response).await;
+                    let _ = isotp_thread.write_payload(&mut Mono, response).await;
                 },
-                (size, buf) = isotp_usb_rx.wait().fuse() => {
+                buf = usb_isotp_thread.read().fuse() => {
                     is_usb = true;
                     let response = diag_server.process_cmd(
-                        &buf[..size],
+                        buf.payload(),
                         Mono::now().duration_since_epoch().to_millis(),
                     );
-                    cx.shared
-                        .usb
-                        .lock(|usb| usb.write_payload(response));
+                    let _ = usb_isotp_thread.write(response).await;
                 },
                 _ = Mono::delay(10.millis()).fuse() => {
                     // Fallthrough so we update KWP server
@@ -344,11 +355,11 @@ mod app {
                 .await
             {
                 match is_usb {
-                    true => cx.shared.usb.lock(|usb| {
-                        usb.write_payload(tx);
-                    }),
+                    true => {
+                        let _ = usb_isotp_thread.write(tx).await;
+                    }
                     false => {
-                        let _ = isotp_thread.write_payload(tx).await;
+                        let _ = isotp_thread.write_payload(&mut Mono, tx).await;
                     }
                 }
             }
@@ -363,7 +374,7 @@ mod app {
         let max = cx.local.tcc_led.get_max_duty() / 4;
         let step = max as u64 / (2000 / DELAY_MS);
         loop {
-            cx.local.tcc_led.set_duty(Channel::_1, i as u32 % max);
+            cx.local.tcc_led.set_duty(Channel::_1, i % max);
             i = i.wrapping_add(step as u32);
             Mono::delay(DELAY_MS.millis()).await;
         }
@@ -372,21 +383,21 @@ mod app {
     #[task(priority = 1, binds=USB_TRCPT0, shared=[usb])]
     fn usb_trcpt0(mut cx: usb_trcpt0::Context) {
         cx.shared.usb.lock(|dev| {
-            poll_usb(dev);
+            dev.poll();
         });
     }
 
     #[task(priority = 1, binds=USB_TRCPT1, shared=[usb])]
     fn usb_trcpt1(mut cx: usb_trcpt1::Context) {
         cx.shared.usb.lock(|dev| {
-            poll_usb(dev);
+            dev.poll();
         });
     }
 
     #[task(priority = 1, binds=USB_OTHER, shared=[usb])]
     fn usb_other(mut cx: usb_other::Context) {
         cx.shared.usb.lock(|dev| {
-            poll_usb(dev);
+            dev.poll();
         });
     }
 
@@ -396,7 +407,7 @@ mod app {
             match interrupt {
                 Interrupt::RxFifo0NewMessage => {
                     for msg in cx.local.can0_fifo0.into_iter() {
-                        if msg.id() == Id::Standard(cx.local.isotp_isr.rx_id) {
+                        if msg.id() == cx.local.isotp_isr.rx_id {
                             let stmin = ST_MIN_EGS.load(Ordering::Relaxed);
                             let bs = BS_EGS.load(Ordering::Relaxed);
                             cx.local.isotp_isr.on_frame_rx(msg.data(), stmin, bs);

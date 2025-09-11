@@ -202,6 +202,7 @@ impl KwpServer {
                 let addr = (*start + (8192 * *current)) as *mut u32;
                 match unsafe { self.nvm.erase_flash(addr, 1) } {
                     Ok(_) => {
+                        defmt::error!("{} {}", current, total_sectors);
                         *current += 1;
                         if *total_sectors == *current {
                             self.pending_operation = PendingOperation::None;
@@ -416,17 +417,17 @@ impl KwpServer {
             // At least 1 arg for LID
             Err(KwpError::SubFunctionNotSupportedInvalidFormat)
         } else if cmd[1] == 0x24 {
-            if self.sec_level != SecurityLevel::FullUnlocked {
-                return Err(KwpError::SecurityAccessDenied);
-            }
             if cmd.len() != 6 {
                 return Err(KwpError::SubFunctionNotSupportedInvalidFormat);
             }
+            if self.sec_level != SecurityLevel::FullUnlocked {
+                return Err(KwpError::SecurityAccessDenied);
+            }
             // Day, Week, Month, year
             if cmd[2] > 31 || cmd[3] > 52 || cmd[4] > 12 || cmd[5] < 24 {
-                return Err(KwpError::SubFunctionNotSupportedInvalidFormat);
+                Err(KwpError::SubFunctionNotSupportedInvalidFormat)
             } else if self.nvm.read_userpage().userpage1_as_slice()[..4] != [0xFF; 4] {
-                return Err(KwpError::ConditionsNotCorrectRequestSequenceError);
+                Err(KwpError::ConditionsNotCorrectRequestSequenceError)
             } else {
                 if unsafe {
                     self.nvm.modify_userpage(|f| {
@@ -442,11 +443,16 @@ impl KwpServer {
                 }
             }
         } else if cmd[1] == 0xE0 {
+            defmt::error!("{:02X}", cmd);
             if cmd.len() != 8 {
                 return Err(KwpError::SubFunctionNotSupportedInvalidFormat);
             }
             let mut start_addr = u32::from_le_bytes(cmd[2..6].try_into().unwrap());
             let num_blocks = u16::from_le_bytes(cmd[6..8].try_into().unwrap());
+
+            if num_blocks == 0 {
+                return Err(KwpError::SubFunctionNotSupportedInvalidFormat);
+            }
 
             if start_addr == MemoryRegion::Bootloader.range_exclusive().start {
                 start_addr = MemoryRegion::Application.range_exclusive().start;

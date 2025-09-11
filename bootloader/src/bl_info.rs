@@ -7,7 +7,7 @@ use konst::{parsing::Parser, result};
 const KB: u32 = 1024;
 const SECTOR_SIZE: u32 = 8192;
 
-const PRELOADER_ADDR_RANGE: Range<u32> = (0 * KB)..(8 * KB);
+const PRELOADER_ADDR_RANGE: Range<u32> = 0..(8 * KB);
 const BOOTLOADER_ADDR_RANGE: Range<u32> = (8 * KB)..(128 * KB);
 const BOOTLOADER_INFO_ADDR_RANGE: Range<u32> = (120 * KB)..(128 * KB);
 const BOOTLOADER_SCRATCH_ADDR_RANGE: Range<u32> = (128 * KB)..(248 * KB);
@@ -114,6 +114,12 @@ pub fn get_bootloader_info() -> &'static BootloaderInfo {
     }
 }
 
+/// Modify the bootloader info page in NVM memory
+///
+/// # Safety
+/// This function erases the info page and then writes it back, therefore
+/// if power loss occurs during erase, then the bootloader info section
+/// will be corrupt
 pub unsafe fn mutate_bootloader_info<F: FnOnce(&mut BootloaderInfo)>(
     nvm: &mut Nvm,
     f: F,

@@ -109,9 +109,8 @@ impl<'a, ID: CanId + 'a, C: Capacities + 'a, const N: usize> IsoTpInterruptHandl
     /// Called when each frame is received
     pub fn on_frame_rx(&mut self, data: &[u8], ecu_stmin: u8, ecu_bs: u8) {
         if data.len() == 8 {
-            let pci = data[0] & 0xF0;
-            match pci {
-                0x00 if data[0] < 8 => {
+            match data[0] {
+                0x00..=0x07 => {
                     // Single frame handling
                     let size = data[0] as usize;
                     let buf = &data[1..1 + size];
@@ -120,7 +119,7 @@ impl<'a, ID: CanId + 'a, C: Capacities + 'a, const N: usize> IsoTpInterruptHandl
                     tmp.size = size;
                     self.rx_ready.write(tmp);
                 }
-                0x10 => {
+                0x10..=0x1F => {
                     // Start of a large payload
                     if let Some(mut can_tx) = self.can_tx.try_access() {
                         // Accept
@@ -128,7 +127,7 @@ impl<'a, ID: CanId + 'a, C: Capacities + 'a, const N: usize> IsoTpInterruptHandl
 
                         let mut shared_buffer = SharedIsoTpBuf::new();
                         shared_buffer.data[..6].copy_from_slice(&data[2..]);
-                        shared_buffer.size = size;
+                        shared_buffer.size = 6;
 
                         if write(self.tx_id, make_fc_ok(ecu_stmin, ecu_bs), &mut can_tx).is_ok() {
                             self.rx_state = IsoTpMode::Rx {
@@ -141,7 +140,7 @@ impl<'a, ID: CanId + 'a, C: Capacities + 'a, const N: usize> IsoTpInterruptHandl
                         }
                     }
                 }
-                0x20 => {
+                0x20..=0x2F => {
                     if let IsoTpMode::Rx {
                         stmin,
                         bs,
@@ -178,18 +177,12 @@ impl<'a, ID: CanId + 'a, C: Capacities + 'a, const N: usize> IsoTpInterruptHandl
                         }
                     }
                 }
-                0x30 => {
-                    // FC from other end
-                    if data[0] == 0x30 {
-                        self.tx_clear_to_send.write(IsotpCtsMsg::Ok {
-                            stmin: data[2],
-                            bs: data[1],
-                        });
-                    } else {
-                        // Reject for 0x31 and 0x32
-                        self.tx_clear_to_send.write(IsotpCtsMsg::Reject);
-                    }
-                }
+                0x30 => self.tx_clear_to_send.write(IsotpCtsMsg::Ok {
+                    stmin: data[2],
+                    bs: data[1],
+                }),
+                0x31 => self.tx_clear_to_send.write(IsotpCtsMsg::Wait),
+                0x32 => self.tx_clear_to_send.write(IsotpCtsMsg::Reject),
                 _ => {}
             }
         }
@@ -219,6 +212,8 @@ pub enum IsoTpMode<const N: usize> {
 pub enum IsotpCtsMsg {
     /// Thread handler can continue with sending
     Ok { stmin: u8, bs: u8 },
+    /// Wait for another flow control msg
+    Wait,
     /// Receiver rejected
     Reject,
 }
@@ -262,15 +257,14 @@ impl<'a, ID: CanId + 'a, C: Capacities + 'a, const N: usize> IsotpConsumer<'a, I
         mono: &mut M,
         buf: &[u8],
     ) -> Result<(), IsoTpTxErr> {
+        let mut tx_buf = [0; 8];
         if buf.len() < 8 {
-            let mut tx_buf = [0; 8];
             tx_buf[0] = buf.len() as u8;
             tx_buf[1..1 + buf.len()].copy_from_slice(buf);
             write(self.tx_id, tx_buf, &mut *self.can_tx.access().await)?;
             Ok(())
         } else {
             // We can send
-            let mut tx_buf = [0; 8];
             tx_buf[0] = 0x10u8 | ((buf.len() >> 8) & 0x0F) as u8;
             tx_buf[1] = (buf.len() & 0xFF) as u8;
             tx_buf[2..].copy_from_slice(&buf[..6]);
@@ -280,12 +274,28 @@ impl<'a, ID: CanId + 'a, C: Capacities + 'a, const N: usize> IsotpConsumer<'a, I
             let mut buf_pos = 6;
             'outer: loop {
                 futures::select_biased! {
+                    // Timeout waiting for flow control, abort the transmission
                     _ = mono.delay_ms(1000).fuse() => {
                         break Err(IsoTpTxErr::Timeout)
                     },
+                    // Receieved a flow control msg
                     fc_result = self.rx_clear_to_send.wait().fuse() => {
                         match fc_result {
                             IsotpCtsMsg::Ok { stmin, bs } => {
+                                // Calculate the delay between sending frames, in microseconds (us)
+                                let micros_sleep = match stmin {
+                                    0 => 100, // No time delay, but wait 100us so we don't lock up the CPU
+                                    1..=0x7F => stmin as u32 * 100, // Milliseconds
+                                    0xF1..=0xF9 => {
+                                        // Microseconds
+                                        100*(stmin-0xF0) as u32
+                                    },
+                                    _ => {
+                                        defmt::error!("Invalid STMIN received {}", stmin);
+                                        100
+                                    }
+                                };
+                                // Send the block
                                 let mut bs_count = bs;
                                 while bs == 0 || bs_count != 0 {
                                     // Send frame
@@ -299,15 +309,13 @@ impl<'a, ID: CanId + 'a, C: Capacities + 'a, const N: usize> IsotpConsumer<'a, I
                                         // Tx complete
                                         break 'outer Ok(());
                                     }
-
-                                    if stmin == 0 {
-                                        mono.delay_us(100).await;
-                                    } else {
-                                        mono.delay_ms(stmin as u32).await;
-                                    }
+                                    mono.delay_us(micros_sleep).await;
                                     pci = 0x20 | (pci + 1) & 0x0F;
                                     bs_count = bs_count.wrapping_sub(1);
                                 }
+                            }
+                            IsotpCtsMsg::Wait => {
+                                // Do nothing (Loop resets, waiting for the next flow control)
                             }
                             IsotpCtsMsg::Reject => {
                                 write(
