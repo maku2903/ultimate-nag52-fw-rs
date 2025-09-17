@@ -4,6 +4,7 @@ use chrono::{Datelike, Utc};
 use clap::{builder::styling::Color, *};
 use clap_num::maybe_hex;
 use console::style;
+use diag_common::BootloaderStayReason;
 use ecu_diagnostics::{channel::{IsoTPChannel, IsoTPSettings}, dynamic_diag::{DiagServerBasicOptions, DiagServerEmptyLogger, DynamicDiagSession, TimeoutConfig}, hardware::{Hardware, HardwareScanner}, kwp2000::{Kwp2000Protocol, KwpCommand, KwpError, KwpSessionType}, DiagError};
 use elf::{abi::PT_LOAD, endian::{self, LittleEndian}};
 use indicatif::{HumanBytes, HumanDuration, MultiProgress, ProgressBar, ProgressStyle};
@@ -92,22 +93,7 @@ pub const EGS_DIAG_SETTINGS: DiagServerBasicOptions = DiagServerBasicOptions {
 
 fn launch_server_usb() -> Result<DynamicDiagSession, Report> {
     println!("Waiting for device to be available...");
-    let port: String;
-    'outer: loop {
-        let ports = serialport::available_ports()?;
-        for p in ports {
-            if let SerialPortType::UsbPort(usb_inf) = p.port_type {
-                if usb_inf.vid == 0x16c0 && usb_inf.pid == 0x27de {
-                    port = p.port_name;
-                    break 'outer;
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_millis(10));
-
-    }
-
-    let serial = UsbDiagIface::new(&port)?;
+    let serial = UsbDiagIface::new()?;
 
     let channel = Box::new(serial) as Box<dyn IsoTPChannel>;
 
@@ -449,13 +435,66 @@ fn ident(server: DynamicDiagSession) -> Result<(), Report> {
 
     map.insert("Debug mode SW", Some(format!("{dbg}")));
 
+    let mut panic_msg: Option<String> = None;
+    let mut panic_location: Option<(String, u32, u32)> = None;
+
+    if ident.diag_info.is_boot_sw() {
+        if let Ok(res) = server.send_byte_array_with_response(&[0x21, 0xE2]) {
+            let txt = match BootloaderStayReason::from(res[2]) {
+                BootloaderStayReason::None => style("Diagnostics").green(),
+                BootloaderStayReason::ResetCount => style("Quick reboot count exceeded").yellow(),
+                BootloaderStayReason::Watchdog => style("Watchdog triggered").red(),
+                BootloaderStayReason::Panic => style("Application panicked (See below)").red(),
+                BootloaderStayReason::MagicPin => style("Magic pin held high").green(),
+                BootloaderStayReason::AppInvalid => style("Application invalid or flashing not completed").yellow(),
+                BootloaderStayReason::Unkown => style("Unknown").yellow(),
+            };
+            map.insert("In Bootloader reason", Some(format!("{}", txt)));
+
+            if BootloaderStayReason::from(res[2]) == BootloaderStayReason::Panic {
+                if let Ok(panic_msg_res) = server.send_byte_array_with_response(&[0x21, 0xE3]) {
+                    let msg = String::from_utf8_lossy(&panic_msg_res[2..]);
+                    panic_msg = Some(msg.to_string());
+                }
+                if let Ok(location_msg_res) = server.send_byte_array_with_response(&[0x21, 0xE4]) {
+                    let column = u32::from_le_bytes(location_msg_res[2..6].try_into().unwrap());
+                    let line = u32::from_le_bytes(location_msg_res[6..10].try_into().unwrap());
+                    let file = String::from_utf8_lossy(&location_msg_res[10..]);
+                    panic_location = Some((file.to_string(), line, column));
+                }
+            }
+
+        } else {
+            map.insert("In Bootloader reason", None);
+        }
+    }
+
     println!("{}", style("Identification information").bold().bright_blue());
     for (k, v) in map {
-        println!("{: <20}: {}",
+        println!("{: <21}: {}",
         style(k).bold(),
         v.map(|x| style(x).green()).unwrap_or(style("REFUSED".into()).bold().red())
         );
     }
+
+    if panic_location.is_some() || panic_msg.is_some() {
+        println!("\n{}", style("Application panic information").bold().bright_red());
+        if let Some(msg) = panic_msg {
+            println!("{: <21}: {}",
+                style("Panic message").bold(),
+                msg
+            );
+        }
+        if let Some((file, line, col)) = panic_location {
+            println!("{: <21}: {}:{}:{}",
+                style("Panic location").bold(),
+                file,
+                line,
+                col
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -507,10 +546,6 @@ fn main() -> Result<()> {
                 println!("{}", 
                     style("Flashing application (Stage 2/2)").bold().green()
                 );
-                drop(server);
-                std::thread::sleep(Duration::from_millis(250));
-                server = create_server(&mut fast_mode, &args)?;
-                std::thread::sleep(Duration::from_millis(250));
             } else {
                 println!("{}", 
                     style("Flashing application").bold().green()
