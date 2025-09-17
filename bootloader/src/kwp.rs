@@ -8,15 +8,22 @@ use atsamd_hal::{
     rtic_time::Monotonic,
     serial_number,
     trng::Trng,
+    usb::UsbBus,
 };
 pub use automotive_diag::kwp2000::*;
 use bootloader::bl_info::MemoryRegion;
 use cortex_m::peripheral::SCB;
 use defmt::println;
+use diag_common::{
+    isotp_endpoints::usb_isotp::UsbIsoTpConsumer,
+    ram_info::{BootloaderRamInfo, MAX_RESET_COUNT},
+    BootloaderStayReason,
+};
+use usbd_serial::DefaultBufferStore;
 
 use crate::{
     bl_info::{self, get_bootloader_info, region_crc},
-    Mono, BS_EGS, ST_MIN_EGS,
+    Mono, BS_EGS, ISOTP_BUF_SIZE, ST_MIN_EGS,
 };
 
 #[derive(Copy, Clone)]
@@ -70,13 +77,15 @@ pub enum SecuritySeedKey {
 pub struct KwpServer {
     buf: [u8; 4096],
     flash_buf: [u8; 4096],
-    mode: KwpSessionType,
+    pub mode: KwpSessionType,
     pending_operation: PendingOperation,
     completed_operation: Option<CompletedOperation>,
     nvm: Nvm,
     last_cmd_time: u64,
     sec_level: SecurityLevel,
     flash_size: u32,
+    old_bl_info: BootloaderRamInfo,
+    bl_reason: BootloaderStayReason,
     _rnd: Trng,
 }
 
@@ -121,7 +130,12 @@ impl KwpServer {
         flash_size - flash_reduction_size
     }
 
-    pub fn new(mut nvm: Nvm, rnd: Trng) -> Self {
+    pub fn new(
+        mut nvm: Nvm,
+        rnd: Trng,
+        bootloader_ram_info: BootloaderRamInfo,
+        bl_reason: BootloaderStayReason,
+    ) -> Self {
         let flash_size = Self::get_flash_size(&mut nvm);
         Self {
             mode: KwpSessionType::Normal,
@@ -133,6 +147,8 @@ impl KwpServer {
             last_cmd_time: 0,
             sec_level: DEFAULT_SEC_MODE,
             flash_size,
+            old_bl_info: bootloader_ram_info,
+            bl_reason,
             _rnd: rnd,
         }
     }
@@ -191,7 +207,7 @@ impl KwpServer {
         }
         match &mut self.pending_operation {
             PendingOperation::Reset => {
-                Mono::delay(1u64.millis()).await;
+                Mono::delay(10u64.millis()).await;
                 SCB::sys_reset();
             }
             PendingOperation::FlashErase {
@@ -202,7 +218,6 @@ impl KwpServer {
                 let addr = (*start + (8192 * *current)) as *mut u32;
                 match unsafe { self.nvm.erase_flash(addr, 1) } {
                     Ok(_) => {
-                        defmt::error!("{} {}", current, total_sectors);
                         *current += 1;
                         if *total_sectors == *current {
                             self.pending_operation = PendingOperation::None;
@@ -344,6 +359,40 @@ impl KwpServer {
                 res[0] = 0xE1;
                 res[1..].copy_from_slice(&sn);
                 Ok(self.make_positive_reply(cmd[0], &res))
+            } else if cmd[1] == 0xE2 {
+                // Enter bootloader reason
+                let mut res = [0; 2];
+                res[0] = 0xE2;
+                res[1] = self.bl_reason as u8;
+                Ok(self.make_positive_reply(cmd[0], &res))
+            } else if cmd[1] == 0xE3 {
+                // Panic message
+                let mut res = [0u8; 512];
+                res[0] = 0xE3;
+                if let Some(panic_info) = self.old_bl_info.app_panic {
+                    let len = core::cmp::min(panic_info.msg().len(), 511);
+                    res[1..1 + len].copy_from_slice(&panic_info.msg().as_bytes()[..len]);
+                    Ok(self.make_positive_reply(cmd[0], &res[..1 + len]))
+                } else {
+                    Ok(self.make_positive_reply(cmd[0], &res[..2]))
+                }
+            } else if cmd[1] == 0xE4 {
+                // Panic location
+                let mut res = [0u8; 512];
+                res[0] = 0xE4;
+                if let Some(panic_info) = self.old_bl_info.app_panic {
+                    if let Some(loc) = panic_info.file() {
+                        let len = core::cmp::min(loc.file_name.len(), 511 - 8);
+                        res[1..5].copy_from_slice(&loc.col.to_le_bytes());
+                        res[5..9].copy_from_slice(&loc.line.to_le_bytes());
+                        res[9..9 + len].copy_from_slice(&loc.file_name.as_bytes()[..len]);
+                        Ok(self.make_positive_reply(cmd[0], &res[..1 + len + 8]))
+                    } else {
+                        Ok(self.make_positive_reply(cmd[0], &res[..2]))
+                    }
+                } else {
+                    Ok(self.make_positive_reply(cmd[0], &res[..2]))
+                }
             } else {
                 Err(KwpError::SubFunctionNotSupportedInvalidFormat)
             }
@@ -371,7 +420,7 @@ impl KwpServer {
                 }
                 response[12] = 0xE1; // Diag version low byte
 
-                let [day, _, month, year] = self.nvm.read_userpage().userpage1_as_slice()[0..4]
+                let [day, _, month, year, ..] = self.nvm.read_userpage().userpage1_as_slice()[0..4]
                 else {
                     unreachable!()
                 };
@@ -558,8 +607,8 @@ impl KwpServer {
         } else if cmd[1] != 0xE0 {
             Err(KwpError::SubFunctionNotSupportedInvalidFormat)
         } else if let Some(completed) = &self.completed_operation {
-            match completed {
-                CompletedOperation::FlashErase(res) => {
+            match (cmd[1], completed) {
+                (0xE0, CompletedOperation::FlashErase(res)) => {
                     if let Err(e) = res {
                         defmt::error!("Flash erase error: {}", e);
                         self.completed_operation = None;
@@ -569,6 +618,7 @@ impl KwpServer {
                         Ok(self.make_positive_reply(cmd[0], &[0xE0, 0x00]))
                     }
                 }
+                _ => Err(KwpError::ConditionsNotCorrectRequestSequenceError),
             }
         } else {
             Err(KwpError::RoutineNotComplete)

@@ -102,7 +102,7 @@ static BOOTLOADER_INFO: BootloaderInfo = BootloaderInfo {
 
 #[inline(always)]
 pub fn region_crc(addr_range: Range<u32>) -> u32 {
-    let start = core::ptr::slice_from_raw_parts(addr_range.start as *mut u8, APP_ADDR_RANGE.len());
+    let start = core::ptr::slice_from_raw_parts(addr_range.start as *mut u8, addr_range.len());
     unsafe { embedded_crc32c::crc32c(start.as_ref().unwrap()) }
 }
 

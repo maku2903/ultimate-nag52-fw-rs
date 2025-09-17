@@ -5,3 +5,39 @@
 
 #[cfg(feature = "mcu")]
 pub mod isotp_endpoints;
+
+#[cfg(feature = "mcu")]
+pub mod userpage;
+
+#[cfg(feature = "mcu")]
+pub mod dyn_panic;
+
+#[cfg(feature = "mcu")]
+pub mod ram_info;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BootloaderStayReason {
+    None = 0,
+    ResetCount = 1,
+    Watchdog = 2,
+    Panic = 3,
+    MagicPin = 4,
+    AppInvalid = 5,
+    Unkown,
+}
+
+impl From<u8> for BootloaderStayReason {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => Self::None,
+            1 => Self::ResetCount,
+            2 => Self::Watchdog,
+            3 => Self::Panic,
+            4 => Self::MagicPin,
+            5 => Self::AppInvalid,
+            _ => Self::Unkown,
+        }
+    }
+}
+
+pub struct KwpPanicInfo {}

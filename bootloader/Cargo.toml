@@ -8,8 +8,9 @@ name = "bootloader"
 path = "src/lib.rs"
 
 [dependencies]
+cortex-m-rt.workspace = true
 bsp = { path = "../bsp" }
-diag_common = {path="../diag_common", features=["mcu"]}
+diag_common = { path = "../diag_common", features = ["mcu"] }
 atsamd-hal = { workspace = true, features = [
     "same54p-rt",
     "can",
@@ -17,8 +18,7 @@ atsamd-hal = { workspace = true, features = [
     "async",
     "rtic",
 ] }
-cortex-m-rt.workspace = true
-cortex-m.workspace = true
+cortex-m = { workspace = true, features = ["inline-asm"] }
 mcan.workspace = true
 konst = "0.4.1"
 defmt = "1.0.1"
@@ -33,7 +33,7 @@ heapless = "0.9.1"
 static_assertions = "1.1.0"
 rtic-sync = "1.4.0"
 futures = { version = "0.3.31", default-features = false }
-embedded-hal = {version="1.0.0"}
+embedded-hal = { version = "1.0.0" }
 
 [build-dependencies]
 chrono = { version = "0.4", default-features = false, features = ["now"] }

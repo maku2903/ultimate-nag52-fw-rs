@@ -58,6 +58,7 @@ use usbd_serial::{SerialPort, USB_CLASS_CDC};
 
 use crate::kwp::KwpServer;
 
+use diag_common::ram_info::*;
 mod bl_info;
 pub mod kwp;
 pub mod usb;
@@ -95,10 +96,15 @@ atsamd_hal::rtc_monotonic!(Mono, rtc_clock::Clock32k);
 #[rtic::app(device = atsamd_hal::pac, dispatchers = [DAC_EMPTY_0])]
 mod app {
     use atsamd_hal::clock::v2::types::Can0;
-    use diag_common::isotp_endpoints::{
-        can_isotp::{make_isotp_endpoint, IsoTpInterruptHandler, IsotpConsumer, IsotpCtsMsg},
-        usb_isotp::{new_usb_isotp, UsbIsoTpConsumer},
-        SharedIsoTpBuf,
+    use automotive_diag::kwp2000::KwpSessionType;
+    use cortex_m::asm::delay;
+    use diag_common::{
+        isotp_endpoints::{
+            can_isotp::{make_isotp_endpoint, IsoTpInterruptHandler, IsotpConsumer, IsotpCtsMsg},
+            usb_isotp::{new_usb_isotp, UsbIsoTpConsumer},
+            SharedIsoTpBuf,
+        },
+        BootloaderStayReason,
     };
     use usbd_serial::DefaultBufferStore;
 
@@ -126,13 +132,16 @@ mod app {
 
     #[shared]
     struct Shared {
+        #[lock_free]
         usb: UsbData<'static>,
+        #[lock_free]
+        old_bootloader_info: BootloaderRamInfo,
     }
 
     #[init(local = [
         #[link_section = ".can"]
         message_ram: SharedMemory<Capacities> = SharedMemory::new(),
-        usb_ctrl_buf: [u8; 256] = [0; 256],
+        usb_ctrl_buf: [u8; 128] = [0; 128],
         usb_alloc: Option<UsbBusAllocator<UsbBus>> = None,
         usb_sn: heapless::String<32> = heapless::String::new(),
         isotp_can_fc_signal: Signal<IsotpCtsMsg> = Signal::new(),
@@ -146,16 +155,56 @@ mod app {
         let mut device = cx.device;
         let mut core: rtic::export::Peripherals = cx.core;
         let pins = bsp::Pins::new(device.port);
+        let mut start_diag_in_reprog_mode = false;
+        let mut old_bootloader_info = BootloaderRamInfo::default();
+        let mut reset_reason = BootloaderStayReason::None;
         #[cfg(not(feature = "stay-in-bootloader"))]
         {
             let rst_rsn = device.rstc.rcause().read();
             if pins.eeprom_sda.into_floating_input().is_low().unwrap() {
                 defmt::warn!("Magic pin connected, staying in bootloader");
+                reset_reason = BootloaderStayReason::MagicPin;
             } else if rst_rsn.wdt().bit_is_set() {
                 defmt::warn!("Watchdog triggered, staying in bootloader!");
+                reset_reason = BootloaderStayReason::Watchdog;
             } else {
+                let mut continue_boot = true;
+                if let Some(ram_info) = get_bootloader_comm_info() {
+                    continue_boot = false;
+                    // Sanity check first to ensure both app and bootloader
+                    // have the same version of the data structure
+                    if ram_info.diag_request_bootloader.0 {
+                        // Asked to enter reprogramming mode
+                        start_diag_in_reprog_mode = true;
+                        if let Some(override_timing) = ram_info.diag_request_bootloader.1 {
+                            ST_MIN_EGS.store(override_timing.0, Ordering::SeqCst);
+                            BS_EGS.store(override_timing.1, Ordering::SeqCst);
+                        }
+                        defmt::warn!("Bootloader Diag reqest received");
+                    } else if ram_info.reset_counter >= MAX_RESET_COUNT {
+                        // Emergency mode (User reset 5 times quickly)
+                        defmt::warn!("Bootloader Reset count exceeded!");
+                        reset_reason = BootloaderStayReason::ResetCount;
+                    } else if ram_info.app_panic.is_some() {
+                        // Panic detected in application
+                        defmt::warn!("Bootloader detected App crashed!");
+                        reset_reason = BootloaderStayReason::Panic;
+                    } else {
+                        // No requirements by the app to stay in bootloader
+                        continue_boot = true;
+                    }
+                    // Copy the current info
+                    old_bootloader_info = ram_info;
+                }
+
                 let bl_info = bl_info::get_bootloader_info();
-                if can_app_start(bl_info) {
+                if BootloaderStayReason::None == reset_reason {
+                    if !can_app_start(bl_info) {
+                        reset_reason = BootloaderStayReason::AppInvalid;
+                    }
+                }
+
+                if can_app_start(bl_info) && continue_boot {
                     let app_addr = MemoryRegion::Application.range_exclusive().start;
                     #[cfg(feature = "skip-app-check")]
                     defmt::warn!("Skip app check enabled - Launching app without verifying");
@@ -165,6 +214,12 @@ mod app {
                     // (1 second / 1024) * period = timeout
                     // 2048 = 2 seconds
                     wdt.start(WatchdogTimeout::Cycles2K as u8);
+
+                    modify_bootloader_info(|state| {
+                        // Application will reset this
+                        state.reset_counter += 1;
+                    });
+
                     unsafe {
                         core.SCB.invalidate_icache();
                         core.SCB.vtor.write(app_addr);
@@ -173,6 +228,10 @@ mod app {
                 }
             }
         }
+
+        // Bootloader init - Reset the bootloader state
+        create_default_comm_info();
+
         // Did not jump to app, start the bootloader diagnostic system
         info!("Bootloader diag start");
         // No app, or we have to stay in bootloader, so now we setup clocks and start the TCU
@@ -215,6 +274,7 @@ mod app {
             pins.can_tx.into_mode(),
             device.can0,
         );
+
         let mut can0_cfg =
             mcan::bus::CanConfigurable::new(HertzU32::Hz(500_000), can0_deps, cx.local.message_ram)
                 .unwrap();
@@ -275,7 +335,6 @@ mod app {
                     .serial_number(cx.local.usb_sn)])
                 .expect("Failed to set strings")
                 .device_class(USB_CLASS_CDC)
-                .usb_rev(UsbRev::Usb200)
                 .build()
                 .unwrap();
         // Configure the USB ISOTP endpoint (Over serial)
@@ -300,13 +359,19 @@ mod app {
         // Diagnostic init
         let nvm = Nvm::new(device.nvmctrl);
         let trng = Trng::new(&mut mclk, device.trng);
-        let server = KwpServer::new(nvm, trng);
+        let mut server = KwpServer::new(nvm, trng, old_bootloader_info, reset_reason);
+        if start_diag_in_reprog_mode {
+            server.mode = KwpSessionType::Reprogramming;
+        }
 
         // Task init
         diag_task::spawn().unwrap();
         led_task::spawn().unwrap();
         (
-            Shared { usb: usb_data },
+            Shared {
+                usb: usb_data,
+                old_bootloader_info,
+            },
             Resources {
                 tcc_led,
                 usb_isotp_thread: isotp_usb_thread,
@@ -381,27 +446,25 @@ mod app {
     }
 
     #[task(priority = 1, binds=USB_TRCPT0, shared=[usb])]
-    fn usb_trcpt0(mut cx: usb_trcpt0::Context) {
-        cx.shared.usb.lock(|dev| {
-            dev.poll();
-        });
+    #[link_section = ".data.usb_trcpt0"]
+    fn usb_trcpt0(cx: usb_trcpt0::Context) {
+        cx.shared.usb.poll();
     }
 
     #[task(priority = 1, binds=USB_TRCPT1, shared=[usb])]
-    fn usb_trcpt1(mut cx: usb_trcpt1::Context) {
-        cx.shared.usb.lock(|dev| {
-            dev.poll();
-        });
+    #[link_section = ".data.usb_trcpt1"]
+    fn usb_trcpt1(cx: usb_trcpt1::Context) {
+        cx.shared.usb.poll();
     }
 
     #[task(priority = 1, binds=USB_OTHER, shared=[usb])]
-    fn usb_other(mut cx: usb_other::Context) {
-        cx.shared.usb.lock(|dev| {
-            dev.poll();
-        });
+    #[link_section = ".data.usb_other"]
+    fn usb_other(cx: usb_other::Context) {
+        cx.shared.usb.poll();
     }
 
     #[task(priority = 1, binds=CAN0, local=[can0_interrupts, can0_fifo0, isotp_isr])]
+    #[link_section = ".data.can0"]
     fn can0(cx: can0::Context) {
         for interrupt in cx.local.can0_interrupts.iter_flagged() {
             match interrupt {
